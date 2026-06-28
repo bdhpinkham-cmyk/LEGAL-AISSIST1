@@ -1227,8 +1227,26 @@ class AppUI:
             password=True, can_reveal_password=True, color=TEXT, width=480,
         )
         self.set_gemini = ft.TextField(
-            label="Gemini API key", value=db.get_setting(config.SETTING_GEMINI_KEY),
+            label="Gemini API key (AI Studio backend)", value=db.get_setting(config.SETTING_GEMINI_KEY),
             password=True, can_reveal_password=True, color=TEXT, width=480,
+        )
+        self.set_gemini_backend = ft.Dropdown(
+            label="Gemini backend",
+            value=db.get_setting(config.SETTING_GEMINI_BACKEND, "api_key"),
+            options=[
+                ft.dropdown.Option("api_key", "Google AI Studio (API key)"),
+                ft.dropdown.Option("vertex", "Vertex AI (project + ADC)"),
+            ],
+            width=320,
+            color=TEXT,
+        )
+        self.set_vertex_project = ft.TextField(
+            label="Vertex GCP project ID", value=db.get_setting(config.SETTING_VERTEX_PROJECT),
+            color=TEXT, width=320,
+        )
+        self.set_vertex_location = ft.TextField(
+            label="Vertex region", value=db.get_setting(config.SETTING_VERTEX_LOCATION, "us-central1"),
+            color=TEXT, width=200,
         )
         self.set_tavily = ft.TextField(
             label="Tavily API key (web search; optional)", value=db.get_setting(config.SETTING_TAVILY_KEY),
@@ -1259,6 +1277,16 @@ class AppUI:
                 self.set_anthropic,
                 self.set_openai,
                 self.set_gemini,
+                ft.Divider(color=SURFACE_2),
+                ft.Text("Gemini backend", weight=ft.FontWeight.BOLD, color=TEXT),
+                ft.Text(
+                    "Vertex AI uses Application Default Credentials — run "
+                    "'gcloud auth application-default login' (or attach a service "
+                    "account) and fill in the project/region. No API key needed.",
+                    size=12, color=MUTED,
+                ),
+                self.set_gemini_backend,
+                ft.Row([self.set_vertex_project, self.set_vertex_location], wrap=True),
             ),
             self._card(
                 ft.Text("Tool keys", weight=ft.FontWeight.BOLD, color=TEXT),
@@ -1284,6 +1312,9 @@ class AppUI:
         db.set_setting(config.SETTING_ANTHROPIC_KEY, self.set_anthropic.value.strip())
         db.set_setting(config.SETTING_OPENAI_KEY, self.set_openai.value.strip())
         db.set_setting(config.SETTING_GEMINI_KEY, self.set_gemini.value.strip())
+        db.set_setting(config.SETTING_GEMINI_BACKEND, self.set_gemini_backend.value)
+        db.set_setting(config.SETTING_VERTEX_PROJECT, self.set_vertex_project.value.strip())
+        db.set_setting(config.SETTING_VERTEX_LOCATION, self.set_vertex_location.value.strip() or "us-central1")
         db.set_setting(config.SETTING_TAVILY_KEY, self.set_tavily.value.strip())
         db.set_setting(config.SETTING_DEEPGRAM_KEY, self.set_deepgram.value.strip())
         self.router.reload()

@@ -10,6 +10,10 @@ requests==2.32.3
 # Cloud LLM SDKs (the router imports lazily; install only what you use).
 anthropic==0.39.0
 openai==1.54.4
+# Unified Google GenAI SDK — supports BOTH Google AI Studio (API key) and
+# Vertex AI (GCP project + Application Default Credentials). Preferred for Gemini.
+google-genai>=1.0.0
+# Legacy Gemini SDK — optional API-key-only fallback if google-genai is absent.
 google-generativeai==0.8.3
 
 # Evidence ingestion.

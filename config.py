@@ -151,6 +151,11 @@ SETTING_OPENAI_KEY = "openai_api_key"
 SETTING_ANTHROPIC_KEY = "anthropic_api_key"
 SETTING_GEMINI_KEY = "gemini_api_key"
 
+# Gemini backend: "api_key" (Google AI Studio) or "vertex" (Vertex AI + ADC).
+SETTING_GEMINI_BACKEND = "gemini_backend"
+SETTING_VERTEX_PROJECT = "vertex_project"
+SETTING_VERTEX_LOCATION = "vertex_location"
+
 
 def tier_setting_keys(tier: str) -> tuple[str, str]:
     """Return the (provider_key, model_key) settings names for a tier."""

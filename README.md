@@ -51,6 +51,21 @@ and all Anthropic models (Pro plan). Exact Gemini model ID strings differ
 slightly between AI Studio and Vertex — if a configured ID is rejected, adjust
 it in **Settings → Model routing**.
 
+### Gemini backend: AI Studio *or* Vertex AI
+
+Gemini access works through either backend, selectable in **Settings → Gemini
+backend**:
+
+* **Google AI Studio** — paste an API key.
+* **Vertex AI** — enter your GCP **project ID** and **region**; auth uses
+  Application Default Credentials. Authenticate once on the machine with
+  `gcloud auth application-default login` (or attach a service account). No API
+  key is stored. On Vertex, multimodal input is sent inline (the AI-Studio-only
+  Files API is avoided), and the PDF page-batching keeps each payload small.
+
+Both backends are driven by the unified `google-genai` SDK; the legacy
+`google-generativeai` package is an optional API-key-only fallback.
+
 ---
 
 ## Pre-Flight Report (bugs caught and fixed during pre-debugging)
@@ -128,7 +143,8 @@ These issues were traced and fixed *before* shipping the code:
 ```
 config.py        Paths, provider catalogue, limits (no third-party deps)
 database.py      Local SQLite — case-isolated schema + CRUD
-llm_router.py    Anthropic / OpenAI / Gemini routing with retry + JSON extraction
+llm_router.py    Task-tiered Anthropic / OpenAI / Gemini routing + JSON extraction
+gemini_client.py Gemini backend abstraction (AI Studio API key OR Vertex AI + ADC)
 rag.py           Local case-isolated TF-IDF vector store (sqlite-backed)
 ingestion.py     PDF/text/EXIF/audio extraction, PII redaction, DOCX pleading export
 agents.py        The 7 agentic engines (except browser automation)

@@ -108,7 +108,11 @@ class LLMRouter:
         return provider, model, self.keys.get(provider, "")
 
     def is_configured(self, tier: str) -> bool:
-        _, _, key = self.resolve(tier)
+        provider, _, key = self.resolve(tier)
+        if provider == "gemini":
+            import gemini_client
+
+            return gemini_client.is_configured()
         return bool(key)
 
     def summary(self) -> str:
@@ -126,10 +130,10 @@ class LLMRouter:
         max_tokens: int = 4000,
     ) -> str:
         provider, model, key = self.resolve(tier)
-        if not key:
+        if not self.is_configured(tier):
             raise LLMError(
-                f"No API key configured for the '{tier}' tier "
-                f"({config.PROVIDERS[provider]['label']}). Add one in Settings."
+                f"The '{tier}' tier ({config.PROVIDERS[provider]['label']}) is not "
+                "configured. Add the key / Vertex project in Settings."
             )
         return self._complete_with(provider, model, key, prompt, system, max_tokens)
 
@@ -202,21 +206,16 @@ class LLMRouter:
         return _with_retries(_call, what=f"OpenAI ({model})")
 
     def _gemini(self, model, key, prompt, system, max_tokens) -> str:
+        # Routed through gemini_client so both AI Studio (API key) and Vertex AI
+        # (project + ADC) backends are supported transparently.
+        import gemini_client
+
         try:
-            import google.generativeai as genai
-        except ImportError as exc:  # pragma: no cover
-            raise LLMError("The 'google-generativeai' package is not installed.") from exc
-        genai.configure(api_key=key)
-        gmodel = genai.GenerativeModel(model_name=model, system_instruction=system)
-
-        def _call() -> str:
-            resp = gmodel.generate_content(
-                prompt,
-                generation_config={"max_output_tokens": min(max_tokens, 8192)},
+            return gemini_client.generate_text(
+                model, prompt, system=system, max_tokens=min(max_tokens, 8192)
             )
-            return (getattr(resp, "text", "") or "").strip()
-
-        return _with_retries(_call, what=f"Gemini ({model})")
+        except gemini_client.GeminiError as exc:
+            raise LLMError(str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------

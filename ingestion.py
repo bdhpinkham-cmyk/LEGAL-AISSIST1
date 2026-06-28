@@ -120,12 +120,15 @@ def extract_document(
     provider), PDFs fall back to local ``pypdf`` text extraction and images fall
     back to an EXIF description.
     """
+    import gemini_client
+
     provider, model, key = (extraction + ("", "", ""))[:3]
+    gemini_ready = provider == "gemini" and gemini_client.is_configured()
     lower = filename.lower()
     ext = os.path.splitext(lower)[1]
 
     if ext == ".pdf":
-        if provider == "gemini" and key:
+        if gemini_ready:
             try:
                 text = gemini_extract_pdf(path, model, key, log=log)
                 if text.strip():
@@ -136,7 +139,7 @@ def extract_document(
         return _extract_pdf(path)
 
     if ext in _IMAGE_MIME:
-        if provider == "gemini" and key:
+        if gemini_ready:
             try:
                 return gemini_extract_image(path, model, key)
             except IngestionError as exc:
@@ -149,69 +152,27 @@ def extract_document(
     return extract_text(path)
 
 
-def _gemini_module(key: str):
-    try:
-        import google.generativeai as genai
-    except ImportError as exc:  # pragma: no cover
-        raise IngestionError(
-            "The 'google-generativeai' package is required for multimodal extraction."
-        ) from exc
-    genai.configure(api_key=key)
-    return genai
+def gemini_extract_image(path: str, model: str, key: str = "") -> str:
+    """OCR + describe a single image via Gemini (AI Studio or Vertex AI)."""
+    import gemini_client
 
-
-def _gemini_upload_and_wait(genai, path: str, mime: str):
-    """Upload a file and block until it is ACTIVE (or raise)."""
-    try:
-        file = genai.upload_file(path=path, mime_type=mime)
-    except Exception as exc:  # noqa: BLE001
-        raise IngestionError(f"Upload to Gemini failed: {exc}") from exc
-    waited = 0
-    while getattr(file.state, "name", "ACTIVE") == "PROCESSING":
-        if waited >= config.GEMINI_UPLOAD_POLL_MAX:
-            raise IngestionError("Gemini file processing timed out.")
-        time.sleep(config.GEMINI_UPLOAD_POLL_SECONDS)
-        waited += config.GEMINI_UPLOAD_POLL_SECONDS
-        file = genai.get_file(file.name)
-    if getattr(file.state, "name", "ACTIVE") == "FAILED":
-        raise IngestionError("Gemini could not process the uploaded file.")
-    return file
-
-
-def _gemini_generate(genai, model: str, parts) -> str:
-    last_exc: Optional[Exception] = None
-    for attempt in range(config.MAX_API_RETRIES):
-        try:
-            gmodel = genai.GenerativeModel(model_name=model)
-            resp = gmodel.generate_content(
-                parts,
-                generation_config={"max_output_tokens": config.GEMINI_EXTRACT_MAX_TOKENS},
-            )
-            return (getattr(resp, "text", "") or "").strip()
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            if attempt < config.MAX_API_RETRIES - 1:
-                time.sleep(config.RETRY_BASE_DELAY * (2 ** attempt))
-    raise IngestionError(f"Gemini extraction call failed: {last_exc}")
-
-
-def gemini_extract_image(path: str, model: str, key: str) -> str:
-    """OCR + describe a single image via Gemini."""
-    genai = _gemini_module(key)
     ext = os.path.splitext(path.lower())[1]
     mime = _IMAGE_MIME.get(ext, "image/jpeg")
-    file = _gemini_upload_and_wait(genai, path, mime)
     try:
-        return _gemini_generate(genai, model, [file, _IMAGE_EXTRACT_PROMPT])
-    finally:
-        _safe_delete(genai, file)
+        return gemini_client.generate_from_file(
+            model, path, mime, _IMAGE_EXTRACT_PROMPT,
+            max_tokens=config.GEMINI_EXTRACT_MAX_TOKENS,
+        )
+    except gemini_client.GeminiError as exc:
+        raise IngestionError(str(exc)) from exc
 
 
-def gemini_extract_pdf(path: str, model: str, key: str, log=lambda _m: None) -> str:
+def gemini_extract_pdf(path: str, model: str, key: str = "", log=lambda _m: None) -> str:
     """Extract a (potentially huge, image-heavy) PDF via Gemini, page-batched.
 
     The PDF is split into ``PDF_PAGE_BATCH``-page chunks so each multimodal call
-    stays under the model's output-token cap even for dense scanned pages. Every
+    stays under the model's output-token cap even for dense scanned pages, and so
+    each inline payload stays small (works on both AI Studio and Vertex). Every
     batch's text is concatenated, then the caller chunks it into the RAG store.
     """
     try:
@@ -219,7 +180,7 @@ def gemini_extract_pdf(path: str, model: str, key: str, log=lambda _m: None) -> 
     except ImportError as exc:  # pragma: no cover
         raise IngestionError("The 'pypdf' package is required for PDF batching.") from exc
 
-    genai = _gemini_module(key)
+    import gemini_client
 
     try:
         reader = PdfReader(path)
@@ -245,18 +206,17 @@ def gemini_extract_pdf(path: str, model: str, key: str, log=lambda _m: None) -> 
         log(f"  Extracting pages {start + 1}-{end} (batch {b + 1}/{n_batches})…")
         tmp_path = _write_pdf_subset(reader, PdfWriter, start, end)
         try:
-            file = _gemini_upload_and_wait(genai, tmp_path, _PDF_MIME)
-            try:
-                prompt = (
-                    f"{_PDF_EXTRACT_PROMPT}\n\n(This is pages {start + 1}-{end} of a "
-                    f"{n_pages}-page document.)"
-                )
-                text = _gemini_generate(genai, model, [file, prompt])
-                if text:
-                    out_parts.append(f"=== PAGES {start + 1}-{end} ===\n{text}")
-            finally:
-                _safe_delete(genai, file)
-        except IngestionError as exc:
+            prompt = (
+                f"{_PDF_EXTRACT_PROMPT}\n\n(This is pages {start + 1}-{end} of a "
+                f"{n_pages}-page document.)"
+            )
+            text = gemini_client.generate_from_file(
+                model, tmp_path, _PDF_MIME, prompt,
+                max_tokens=config.GEMINI_EXTRACT_MAX_TOKENS,
+            )
+            if text:
+                out_parts.append(f"=== PAGES {start + 1}-{end} ===\n{text}")
+        except gemini_client.GeminiError as exc:
             log(f"  Batch {b + 1} failed: {exc} (continuing)")
         finally:
             _safe_unlink(tmp_path)
@@ -276,13 +236,6 @@ def _write_pdf_subset(reader, writer_cls, start: int, end: int) -> str:
     with open(tmp_path, "wb") as fh:
         writer.write(fh)
     return tmp_path
-
-
-def _safe_delete(genai, file) -> None:
-    try:
-        genai.delete_file(file.name)
-    except Exception:  # noqa: BLE001
-        pass
 
 
 def _safe_unlink(path: str) -> None:

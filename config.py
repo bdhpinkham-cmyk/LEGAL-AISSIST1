@@ -155,6 +155,9 @@ SETTING_GEMINI_KEY = "gemini_api_key"
 SETTING_GEMINI_BACKEND = "gemini_backend"
 SETTING_VERTEX_PROJECT = "vertex_project"
 SETTING_VERTEX_LOCATION = "vertex_location"
+# Optional path to a GCP service-account JSON. When set, it is exported as
+# GOOGLE_APPLICATION_CREDENTIALS so Vertex works without the gcloud CLI.
+SETTING_VERTEX_SA_PATH = "vertex_sa_path"
 
 
 def tier_setting_keys(tier: str) -> tuple[str, str]:

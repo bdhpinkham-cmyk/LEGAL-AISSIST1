@@ -28,6 +28,7 @@ Implementation notes
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Optional, Tuple
 
@@ -48,7 +49,14 @@ def _settings() -> dict:
         "api_key": db.get_setting(config.SETTING_GEMINI_KEY),
         "project": db.get_setting(config.SETTING_VERTEX_PROJECT),
         "location": db.get_setting(config.SETTING_VERTEX_LOCATION, "us-central1"),
+        "sa_path": db.get_setting(config.SETTING_VERTEX_SA_PATH),
     }
+
+
+def _apply_service_account(sa_path: str) -> None:
+    """Export a service-account JSON as ADC so Vertex needs no gcloud CLI."""
+    if sa_path and os.path.isfile(sa_path):
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = sa_path
 
 
 def is_configured() -> bool:
@@ -80,6 +88,7 @@ def _new_client() -> Tuple[str, object]:
         if s["backend"] == "vertex":
             if not s["project"]:
                 raise GeminiError("Vertex AI is selected but no GCP project is set.")
+            _apply_service_account(s["sa_path"])
             return "genai", genai.Client(
                 vertexai=True,
                 project=s["project"],

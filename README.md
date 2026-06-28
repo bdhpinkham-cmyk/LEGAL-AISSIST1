@@ -57,11 +57,13 @@ Gemini access works through either backend, selectable in **Settings → Gemini
 backend**:
 
 * **Google AI Studio** — paste an API key.
-* **Vertex AI** — enter your GCP **project ID** and **region**; auth uses
-  Application Default Credentials. Authenticate once on the machine with
-  `gcloud auth application-default login` (or attach a service account). No API
-  key is stored. On Vertex, multimodal input is sent inline (the AI-Studio-only
-  Files API is avoided), and the PDF page-batching keeps each payload small.
+* **Vertex AI** — enter your GCP **project ID** and **region**. Auth uses
+  Application Default Credentials, supplied either by `gcloud auth
+  application-default login` **or** by picking a **service-account JSON** in
+  Settings (no gcloud CLI needed — the app exports it as
+  `GOOGLE_APPLICATION_CREDENTIALS`). No API key is stored. On Vertex, multimodal
+  input is sent inline (the AI-Studio-only Files API is avoided), and the PDF
+  page-batching keeps each payload small.
 
 Both backends are driven by the unified `google-genai` SDK; the legacy
 `google-generativeai` package is an optional API-key-only fallback.

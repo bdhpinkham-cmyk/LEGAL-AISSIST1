@@ -80,9 +80,10 @@ class AppUI:
         self._portal_event = threading.Event()
         self._portal_decision = True
 
-        # File pickers.
+        # File pickers (registered once so the overlay isn't duplicated on re-render).
         self.evidence_picker = ft.FilePicker(on_result=self._on_evidence_picked)
-        self.page.overlay.append(self.evidence_picker)
+        self.sa_picker = ft.FilePicker(on_result=self._on_sa_picked)
+        self.page.overlay.extend([self.evidence_picker, self.sa_picker])
 
         self.content = ft.Column(expand=True, scroll=ft.ScrollMode.AUTO, spacing=12)
         self._build_shell()
@@ -1248,6 +1249,11 @@ class AppUI:
             label="Vertex region", value=db.get_setting(config.SETTING_VERTEX_LOCATION, "us-central1"),
             color=TEXT, width=200,
         )
+        self.set_vertex_sa = ft.TextField(
+            label="Service account JSON (optional — avoids needing gcloud CLI)",
+            value=db.get_setting(config.SETTING_VERTEX_SA_PATH),
+            color=TEXT, width=480, read_only=True,
+        )
         self.set_tavily = ft.TextField(
             label="Tavily API key (web search; optional)", value=db.get_setting(config.SETTING_TAVILY_KEY),
             password=True, can_reveal_password=True, color=TEXT, width=480,
@@ -1287,6 +1293,22 @@ class AppUI:
                 ),
                 self.set_gemini_backend,
                 ft.Row([self.set_vertex_project, self.set_vertex_location], wrap=True),
+                ft.Row(
+                    [
+                        self.set_vertex_sa,
+                        ft.OutlinedButton(
+                            "Choose JSON…",
+                            icon="vpn_key",
+                            on_click=lambda e: self.sa_picker.pick_files(
+                                allow_multiple=False, allowed_extensions=["json"]
+                            ),
+                        ),
+                        ft.TextButton(
+                            "Clear", on_click=self._clear_sa
+                        ),
+                    ],
+                    wrap=True,
+                ),
             ),
             self._card(
                 ft.Text("Tool keys", weight=ft.FontWeight.BOLD, color=TEXT),
@@ -1295,6 +1317,21 @@ class AppUI:
             ),
             ft.FilledButton("Save settings", icon="save", on_click=self._save_settings),
         )
+
+    def _on_sa_picked(self, e: ft.FilePickerResultEvent) -> None:
+        if e.files and e.files[0].path:
+            path = e.files[0].path
+            db.set_setting(config.SETTING_VERTEX_SA_PATH, path)
+            if hasattr(self, "set_vertex_sa"):
+                self.set_vertex_sa.value = path
+                self.page.update()
+            self.snack("Service account JSON selected.", OK)
+
+    def _clear_sa(self, e: ft.ControlEvent) -> None:
+        db.set_setting(config.SETTING_VERTEX_SA_PATH, "")
+        if hasattr(self, "set_vertex_sa"):
+            self.set_vertex_sa.value = ""
+            self.page.update()
 
     def _on_tier_provider_change(self, tier: str) -> None:
         controls = self.tier_controls[tier]
@@ -1315,6 +1352,7 @@ class AppUI:
         db.set_setting(config.SETTING_GEMINI_BACKEND, self.set_gemini_backend.value)
         db.set_setting(config.SETTING_VERTEX_PROJECT, self.set_vertex_project.value.strip())
         db.set_setting(config.SETTING_VERTEX_LOCATION, self.set_vertex_location.value.strip() or "us-central1")
+        db.set_setting(config.SETTING_VERTEX_SA_PATH, self.set_vertex_sa.value.strip())
         db.set_setting(config.SETTING_TAVILY_KEY, self.set_tavily.value.strip())
         db.set_setting(config.SETTING_DEEPGRAM_KEY, self.set_deepgram.value.strip())
         self.router.reload()

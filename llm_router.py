@@ -1,32 +1,38 @@
 """
 llm_router.py
 =============
-A single entry point for talking to cloud LLMs (Anthropic, OpenAI, Gemini).
+Task-tiered entry point for talking to cloud LLMs (Anthropic, OpenAI, Gemini).
 
-Why a router?
--------------
-Local desktop/mobile hardware can't run a frontier model, so heavy reasoning is
-delegated to a cloud provider chosen by the user. The router hides the
-per-provider SDK differences behind two methods:
+Why tiers?
+----------
+Different tasks deserve different models. The router maps each call to one of
+three tiers (configurable in Settings):
 
-    router.complete(prompt, system=..., max_tokens=...)   -> str
-    router.complete_json(prompt, system=..., schema_hint=) -> dict | list
+    extraction  -> Gemini 3.5 Flash  (fast, cheap, huge-context multimodal
+                                       parsing / OCR of PDFs and images)
+    medium      -> Sonnet 4.6 / Opus 4.6 / Gemini 3.1 Pro (everyday reasoning)
+    heavy       -> Opus 4.8          (the most demanding synthesis only)
+
+Callers select a tier:
+
+    router.complete(prompt, tier="medium")          -> str
+    router.complete_json(prompt, tier="medium")     -> dict | list
+    router.complete(prompt, tier="heavy")           -> str  (brief drafting)
+    router.resolve("extraction")                     -> (provider, model, key)
+
+Multimodal document parsing itself lives in ``ingestion`` (it needs file I/O),
+but it asks this router which provider/model/key to use for the extraction tier.
 
 Pre-debugging decisions
 -----------------------
-* **Rate limits & transient errors:** Every network call is wrapped in
-  :func:`_with_retries`, which retries on rate-limit / 5xx / connection errors
-  using exponential backoff (config.MAX_API_RETRIES attempts). Non-retryable
-  client errors (bad key, bad request) are surfaced immediately as
-  :class:`LLMError` so the UI can show a clear message instead of hanging.
-
-* **No hard SDK import at module load:** Provider SDKs are imported lazily
-  inside the call path. A user who only configured Anthropic never needs the
-  OpenAI/Gemini packages installed for the app to import.
-
-* **Robust JSON extraction:** Models sometimes wrap JSON in markdown fences or
-  add prose. :meth:`complete_json` strips fences and locates the first valid
-  JSON object/array, raising a clear error if none is found.
+* **Rate limits & transient errors:** every network call goes through
+  :func:`_with_retries` (exponential backoff, ``config.MAX_API_RETRIES``).
+* **Lazy SDK imports:** a user who only configured one provider never needs the
+  others installed.
+* **Robust JSON extraction:** models sometimes wrap JSON in fences / prose;
+  :func:`_extract_json` strips fences and finds the first balanced JSON value.
+* **Clear missing-key errors:** if a tier resolves to a provider without a key,
+  the error names the tier and provider so the UI can guide the user.
 """
 
 from __future__ import annotations
@@ -34,7 +40,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import config
 import database as db
@@ -53,30 +59,20 @@ def _with_retries(fn, *, what: str):
     for attempt in range(config.MAX_API_RETRIES):
         try:
             return fn()
-        except Exception as exc:  # noqa: BLE001 - we classify below
+        except Exception as exc:  # noqa: BLE001 - classified below
             message = str(exc).lower()
             retryable = any(
                 token in message
                 for token in (
-                    "rate limit",
-                    "ratelimit",
-                    "429",
-                    "overloaded",
-                    "timeout",
-                    "timed out",
-                    "connection",
-                    "temporarily",
-                    "500",
-                    "502",
-                    "503",
-                    "529",
+                    "rate limit", "ratelimit", "429", "overloaded", "timeout",
+                    "timed out", "connection", "temporarily", "500", "502",
+                    "503", "529", "resource has been exhausted", "unavailable",
                 )
             )
             last_exc = exc
             if not retryable or attempt == config.MAX_API_RETRIES - 1:
                 break
-            delay = config.RETRY_BASE_DELAY * (2 ** attempt)
-            time.sleep(delay)
+            time.sleep(config.RETRY_BASE_DELAY * (2 ** attempt))
     raise LLMError(f"{what} failed after retries: {last_exc}")
 
 
@@ -84,76 +80,98 @@ def _with_retries(fn, *, what: str):
 # Router
 # ---------------------------------------------------------------------------
 class LLMRouter:
-    """Routes completion requests to the user-selected provider."""
+    """Routes completion requests to the model configured for each task tier."""
 
     def __init__(self) -> None:
         self.reload()
 
     def reload(self) -> None:
-        """Re-read provider / model / key selection from the settings table."""
-        self.provider = db.get_setting(
-            config.SETTING_ACTIVE_PROVIDER, config.DEFAULT_PROVIDER
-        )
-        if self.provider not in config.PROVIDERS:
-            self.provider = config.DEFAULT_PROVIDER
-        default_model = config.PROVIDERS[self.provider]["default_model"]
-        self.model = db.get_setting(config.SETTING_ACTIVE_MODEL, default_model)
+        """Re-read tier routing and API keys from the settings table."""
         self.keys = {
             "anthropic": db.get_setting(config.SETTING_ANTHROPIC_KEY),
             "openai": db.get_setting(config.SETTING_OPENAI_KEY),
             "gemini": db.get_setting(config.SETTING_GEMINI_KEY),
         }
+        self.tiers: Dict[str, Tuple[str, str]] = {}
+        for tier, (def_provider, def_model) in config.TIER_DEFAULTS.items():
+            pkey, mkey = config.tier_setting_keys(tier)
+            provider = db.get_setting(pkey, def_provider)
+            if provider not in config.PROVIDERS:
+                provider = def_provider
+            model = db.get_setting(mkey, def_model)
+            self.tiers[tier] = (provider, model)
+
+    # -- introspection -----------------------------------------------------
+    def resolve(self, tier: str) -> Tuple[str, str, str]:
+        """Return (provider, model, api_key) for a tier; "" key if unset."""
+        provider, model = self.tiers.get(tier, config.TIER_DEFAULTS[config.TIER_MEDIUM])
+        return provider, model, self.keys.get(provider, "")
+
+    def is_configured(self, tier: str) -> bool:
+        _, _, key = self.resolve(tier)
+        return bool(key)
+
+    def summary(self) -> str:
+        e = self.tiers[config.TIER_EXTRACTION][1]
+        m = self.tiers[config.TIER_MEDIUM][1]
+        h = self.tiers[config.TIER_HEAVY][1]
+        return f"Extract: {e}  ·  Medium: {m}  ·  Heavy: {h}"
 
     # -- public API --------------------------------------------------------
-    def is_configured(self) -> bool:
-        return bool(self.keys.get(self.provider))
-
-    def active_label(self) -> str:
-        return f"{config.PROVIDERS[self.provider]['label']} · {self.model}"
-
     def complete(
         self,
         prompt: str,
+        tier: str = config.TIER_MEDIUM,
         system: str = "You are a meticulous legal-analysis assistant.",
         max_tokens: int = 4000,
     ) -> str:
-        """Return the model's text response for ``prompt``."""
-        if not self.is_configured():
+        provider, model, key = self.resolve(tier)
+        if not key:
             raise LLMError(
-                f"No API key configured for {config.PROVIDERS[self.provider]['label']}. "
-                "Add one in Settings."
+                f"No API key configured for the '{tier}' tier "
+                f"({config.PROVIDERS[provider]['label']}). Add one in Settings."
             )
-        if self.provider == "anthropic":
-            return self._complete_anthropic(prompt, system, max_tokens)
-        if self.provider == "openai":
-            return self._complete_openai(prompt, system, max_tokens)
-        if self.provider == "gemini":
-            return self._complete_gemini(prompt, system, max_tokens)
-        raise LLMError(f"Unknown provider: {self.provider}")
+        return self._complete_with(provider, model, key, prompt, system, max_tokens)
 
     def complete_json(
         self,
         prompt: str,
+        tier: str = config.TIER_MEDIUM,
         system: str = "You are a meticulous legal-analysis assistant. "
         "Reply with valid JSON only — no markdown, no commentary.",
         max_tokens: int = 4000,
     ) -> Any:
-        """Return parsed JSON from the model. Raises LLMError on parse failure."""
-        raw = self.complete(prompt, system=system, max_tokens=max_tokens)
+        raw = self.complete(prompt, tier=tier, system=system, max_tokens=max_tokens)
         return _extract_json(raw)
 
-    # -- provider implementations -----------------------------------------
-    def _complete_anthropic(self, prompt: str, system: str, max_tokens: int) -> str:
+    # -- provider dispatch -------------------------------------------------
+    def _complete_with(
+        self,
+        provider: str,
+        model: str,
+        key: str,
+        prompt: str,
+        system: str,
+        max_tokens: int,
+    ) -> str:
+        if provider == "anthropic":
+            return self._anthropic(model, key, prompt, system, max_tokens)
+        if provider == "openai":
+            return self._openai(model, key, prompt, system, max_tokens)
+        if provider == "gemini":
+            return self._gemini(model, key, prompt, system, max_tokens)
+        raise LLMError(f"Unknown provider: {provider}")
+
+    def _anthropic(self, model, key, prompt, system, max_tokens) -> str:
         try:
             import anthropic
         except ImportError as exc:  # pragma: no cover
             raise LLMError("The 'anthropic' package is not installed.") from exc
-
-        client = anthropic.Anthropic(api_key=self.keys["anthropic"])
+        client = anthropic.Anthropic(api_key=key)
 
         def _call() -> str:
             resp = client.messages.create(
-                model=self.model,
+                model=model,
                 max_tokens=min(max_tokens, 8000),
                 system=system,
                 messages=[{"role": "user", "content": prompt}],
@@ -161,19 +179,18 @@ class LLMRouter:
             parts = [b.text for b in resp.content if getattr(b, "type", "") == "text"]
             return "\n".join(parts).strip()
 
-        return _with_retries(_call, what="Anthropic completion")
+        return _with_retries(_call, what=f"Anthropic ({model})")
 
-    def _complete_openai(self, prompt: str, system: str, max_tokens: int) -> str:
+    def _openai(self, model, key, prompt, system, max_tokens) -> str:
         try:
             from openai import OpenAI
         except ImportError as exc:  # pragma: no cover
             raise LLMError("The 'openai' package is not installed.") from exc
-
-        client = OpenAI(api_key=self.keys["openai"])
+        client = OpenAI(api_key=key)
 
         def _call() -> str:
             resp = client.chat.completions.create(
-                model=self.model,
+                model=model,
                 max_tokens=min(max_tokens, 8000),
                 messages=[
                     {"role": "system", "content": system},
@@ -182,27 +199,24 @@ class LLMRouter:
             )
             return (resp.choices[0].message.content or "").strip()
 
-        return _with_retries(_call, what="OpenAI completion")
+        return _with_retries(_call, what=f"OpenAI ({model})")
 
-    def _complete_gemini(self, prompt: str, system: str, max_tokens: int) -> str:
+    def _gemini(self, model, key, prompt, system, max_tokens) -> str:
         try:
             import google.generativeai as genai
         except ImportError as exc:  # pragma: no cover
             raise LLMError("The 'google-generativeai' package is not installed.") from exc
-
-        genai.configure(api_key=self.keys["gemini"])
-        model = genai.GenerativeModel(
-            model_name=self.model, system_instruction=system
-        )
+        genai.configure(api_key=key)
+        gmodel = genai.GenerativeModel(model_name=model, system_instruction=system)
 
         def _call() -> str:
-            resp = model.generate_content(
+            resp = gmodel.generate_content(
                 prompt,
-                generation_config={"max_output_tokens": min(max_tokens, 8000)},
+                generation_config={"max_output_tokens": min(max_tokens, 8192)},
             )
-            return (resp.text or "").strip()
+            return (getattr(resp, "text", "") or "").strip()
 
-        return _with_retries(_call, what="Gemini completion")
+        return _with_retries(_call, what=f"Gemini ({model})")
 
 
 # ---------------------------------------------------------------------------
@@ -211,19 +225,13 @@ class LLMRouter:
 def _extract_json(raw: str) -> Any:
     """Best-effort extraction of a JSON object/array from a model response."""
     text = raw.strip()
-
-    # Strip ```json ... ``` fences if present.
     fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
     if fence:
         text = fence.group(1).strip()
-
-    # Direct parse first.
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-
-    # Fall back to locating the first balanced JSON object or array.
     for opener, closer in (("{", "}"), ("[", "]")):
         start = text.find(opener)
         if start == -1:

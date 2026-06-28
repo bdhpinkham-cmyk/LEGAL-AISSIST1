@@ -36,6 +36,7 @@ import config
 import database as db
 from ingestion import (
     IngestionError,
+    extract_document,
     extract_image_metadata,
     extract_text,
     redact_pii,
@@ -76,11 +77,16 @@ class DiscoveryTimelineEngine:
         doc_type = "document"
         content = ""
 
+        # The extraction tier (default Gemini 3.5 Flash) handles multimodal OCR.
+        extraction = self.router.resolve(config.TIER_EXTRACTION)
+
         if lower.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".tif", ".tiff")):
             doc_type = "image"
             log("Extracting image metadata (EXIF / GPS)…")
             metadata = extract_image_metadata(path)
-            content = self._describe_image_metadata(filename, metadata)
+            log("Reading image (OCR + visual description)…")
+            visual = extract_document(path, filename, extraction, log=log)
+            content = self._describe_image_metadata(filename, metadata) + "\n\n" + visual
         elif lower.endswith(
             (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".mp4", ".mov", ".m4v", ".webm")
         ):
@@ -92,9 +98,9 @@ class DiscoveryTimelineEngine:
                 openai_key=db.get_setting(config.SETTING_OPENAI_KEY),
             )
         else:
-            doc_type = "document"
-            log("Extracting document text…")
-            content = extract_text(path)
+            doc_type = "pdf" if lower.endswith(".pdf") else "document"
+            log("Parsing document (multimodal OCR for scanned/image pages)…")
+            content = extract_document(path, filename, extraction, log=log)
 
         if not content.strip():
             raise IngestionError(
@@ -110,7 +116,7 @@ class DiscoveryTimelineEngine:
         STORE.add_document(case_id, document_id, filename, content)
 
         log("Extracting facts with the LLM…")
-        facts = self._extract_facts(content, filename)
+        facts = self._extract_facts(content, filename, log=log)
         for fact in facts:
             db.add_timeline_event(
                 case_id,
@@ -146,30 +152,42 @@ class DiscoveryTimelineEngine:
             )
         return "\n".join(lines)
 
-    def _extract_facts(self, content: str, source: str) -> List[Dict[str, Any]]:
-        # Cap the content fed to the model to a sensible window.
-        excerpt = content[:12000]
-        prompt = (
-            "Extract every discrete, objective fact from the following evidence. "
-            "Return a JSON array. Each element MUST have keys: "
-            '"date" (ISO YYYY-MM-DD if a date is present, else ""), '
-            '"fact" (a single factual statement), '
-            '"actors" (array of people/entities involved). '
-            "Do not invent facts. Only include what the text supports.\n\n"
-            f"SOURCE: {source}\n\nEVIDENCE:\n{excerpt}"
-        )
-        try:
-            data = self.router.complete_json(prompt, max_tokens=4000)
-        except LLMError:
-            return []
-        if isinstance(data, dict) and "facts" in data:
-            data = data["facts"]
-        if not isinstance(data, list):
-            return []
-        cleaned = []
-        for item in data:
-            if isinstance(item, dict) and item.get("fact"):
-                cleaned.append(item)
+    def _extract_facts(self, content: str, source: str, log: LogFn = _noop) -> List[Dict[str, Any]]:
+        """Sweep the ENTIRE document in windows so no facts are dropped on long files."""
+        window = config.FACT_WINDOW_CHARS
+        windows = [content[i : i + window] for i in range(0, len(content), window)]
+        windows = windows[: config.FACT_MAX_WINDOWS]
+        cleaned: List[Dict[str, Any]] = []
+        seen: set = set()
+        for idx, excerpt in enumerate(windows, 1):
+            if len(windows) > 1:
+                log(f"Extracting facts (section {idx}/{len(windows)})…")
+            prompt = (
+                "Extract every discrete, objective fact from the following evidence "
+                "excerpt. Return a JSON array. Each element MUST have keys: "
+                '"date" (ISO YYYY-MM-DD if a date is present, else ""), '
+                '"fact" (a single factual statement), '
+                '"actors" (array of people/entities involved). '
+                "Do not invent facts. Only include what the text supports.\n\n"
+                f"SOURCE: {source}\n\nEVIDENCE EXCERPT:\n{excerpt}"
+            )
+            try:
+                data = self.router.complete_json(
+                    prompt, tier=config.TIER_MEDIUM, max_tokens=4000
+                )
+            except LLMError:
+                continue
+            if isinstance(data, dict) and "facts" in data:
+                data = data["facts"]
+            if not isinstance(data, list):
+                continue
+            for item in data:
+                if isinstance(item, dict) and item.get("fact"):
+                    key = (item.get("date", ""), item.get("fact", "").strip().lower())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    cleaned.append(item)
         return cleaned
 
     def analyze_inconsistencies(self, case_id: int, log: LogFn = _noop) -> int:
@@ -500,7 +518,8 @@ class BriefBuilder:
             f"ESTABLISHED FACTS / TIMELINE:\n{facts_block or '(none on file)'}\n\n"
             f"RESEARCH MEMO:\n{research_memo or '(none provided)'}"
         )
-        return self.router.complete(prompt, max_tokens=8000)
+        # Heaviest synthesis task in the app — route to the heavy tier (Opus 4.8).
+        return self.router.complete(prompt, tier=config.TIER_HEAVY, max_tokens=8000)
 
 
 # ===========================================================================

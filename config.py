@@ -87,6 +87,7 @@ PROVIDERS = {
         "default_model": "claude-opus-4-8",
         "models": [
             "claude-opus-4-8",
+            "claude-opus-4-6",
             "claude-sonnet-4-6",
             "claude-haiku-4-5",
         ],
@@ -100,22 +101,61 @@ PROVIDERS = {
     },
     "gemini": {
         "label": "Google (Gemini)",
-        "default_model": "gemini-1.5-pro",
-        "models": ["gemini-1.5-pro", "gemini-1.5-flash"],
+        "default_model": "gemini-3.1-pro",
+        "models": [
+            "gemini-3.5-flash",
+            "gemini-3.1-pro",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-1.5-pro",
+            "gemini-1.5-flash",
+        ],
         "settings_key": "gemini_api_key",
     },
 }
 
 DEFAULT_PROVIDER = "anthropic"
 
+# ---------------------------------------------------------------------------
+# Task-tiered model routing
+# ---------------------------------------------------------------------------
+# Rather than one "active model", work is routed to a tier chosen for the task:
+#
+#   * extraction — high-throughput multimodal parsing / OCR of PDFs and images
+#                  and other mechanical extraction. Cheap, fast, huge context.
+#   * medium     — everyday reasoning (fact extraction, inconsistency analysis,
+#                  research loop decisions, chat, deadlines, cross-exam, intake).
+#   * heavy      — the most demanding synthesis (final brief drafting).
+#
+# Defaults follow the user's preferences and can be overridden in Settings.
+TIER_EXTRACTION = "extraction"
+TIER_MEDIUM = "medium"
+TIER_HEAVY = "heavy"
+
+TIER_DEFAULTS = {
+    TIER_EXTRACTION: ("gemini", "gemini-3.5-flash"),
+    TIER_MEDIUM: ("anthropic", "claude-sonnet-4-6"),
+    TIER_HEAVY: ("anthropic", "claude-opus-4-8"),
+}
+
+TIER_LABELS = {
+    TIER_EXTRACTION: "Extraction / parsing (multimodal)",
+    TIER_MEDIUM: "Medium reasoning",
+    TIER_HEAVY: "Heavy reasoning",
+}
+
 # Settings keys (stored in the global ``settings`` table).
-SETTING_ACTIVE_PROVIDER = "active_provider"
-SETTING_ACTIVE_MODEL = "active_model"
 SETTING_TAVILY_KEY = "tavily_api_key"
 SETTING_DEEPGRAM_KEY = "deepgram_api_key"
 SETTING_OPENAI_KEY = "openai_api_key"
 SETTING_ANTHROPIC_KEY = "anthropic_api_key"
 SETTING_GEMINI_KEY = "gemini_api_key"
+
+
+def tier_setting_keys(tier: str) -> tuple[str, str]:
+    """Return the (provider_key, model_key) settings names for a tier."""
+    return (f"tier_{tier}_provider", f"tier_{tier}_model")
+
 
 # Hard limits to keep iterative agents from running away.
 MAX_RESEARCH_ITERATIONS = 5
@@ -130,3 +170,20 @@ RETRY_BASE_DELAY = 2.0  # seconds; exponential backoff base
 RAG_CHUNK_SIZE = 1200  # characters
 RAG_CHUNK_OVERLAP = 200
 RAG_TOP_K = 6
+
+# ---------------------------------------------------------------------------
+# Large-document / multimodal ingestion parameters
+# ---------------------------------------------------------------------------
+# Big, image-heavy PDFs are split into page batches and each batch is sent to
+# the multimodal extraction model (Gemini). Keeping the batch small keeps each
+# response under the model's output-token cap even for dense, scanned pages.
+PDF_PAGE_BATCH = 15            # pages per multimodal extraction request
+PDF_MAX_BATCHES = 400          # safety cap (=> up to 6,000 pages per file)
+GEMINI_EXTRACT_MAX_TOKENS = 8192
+GEMINI_UPLOAD_POLL_SECONDS = 2.0
+GEMINI_UPLOAD_POLL_MAX = 120   # ~4 minutes of processing wait per upload
+
+# Fact extraction sweeps the *entire* parsed document in windows so nothing is
+# dropped on long files (the model is called once per window, bounded by the cap).
+FACT_WINDOW_CHARS = 15000
+FACT_MAX_WINDOWS = 40

@@ -159,9 +159,9 @@ class AppUI:
 
     def _provider_label(self) -> str:
         try:
-            return self.router.active_label()
+            return self.router.summary()
         except Exception:  # noqa: BLE001
-            return "No provider configured"
+            return "No models configured"
 
     # ======================================================================
     # Generic helpers
@@ -1184,25 +1184,40 @@ class AppUI:
     # Settings
     # ======================================================================
     def show_settings(self) -> None:
-        provider = db.get_setting(config.SETTING_ACTIVE_PROVIDER, config.DEFAULT_PROVIDER)
-        model = db.get_setting(
-            config.SETTING_ACTIVE_MODEL, config.PROVIDERS[provider]["default_model"]
-        )
-        self.set_provider = ft.Dropdown(
-            label="Active LLM provider",
-            value=provider,
-            options=[ft.dropdown.Option(k, v["label"]) for k, v in config.PROVIDERS.items()],
-            on_change=self._on_provider_change,
-            width=360,
-            color=TEXT,
-        )
-        self.set_model = ft.Dropdown(
-            label="Model",
-            value=model,
-            options=[ft.dropdown.Option(m) for m in config.PROVIDERS[provider]["models"]],
-            width=360,
-            color=TEXT,
-        )
+        # Build a provider+model selector pair for each task tier.
+        self.tier_controls: Dict[str, Dict[str, ft.Dropdown]] = {}
+        tier_cards: List[ft.Control] = []
+        for tier in (config.TIER_EXTRACTION, config.TIER_MEDIUM, config.TIER_HEAVY):
+            def_provider, def_model = config.TIER_DEFAULTS[tier]
+            pkey, mkey = config.tier_setting_keys(tier)
+            provider = db.get_setting(pkey, def_provider)
+            if provider not in config.PROVIDERS:
+                provider = def_provider
+            model = db.get_setting(mkey, def_model)
+
+            model_dd = ft.Dropdown(
+                label="Model",
+                value=model,
+                options=[ft.dropdown.Option(m) for m in config.PROVIDERS[provider]["models"]],
+                width=320,
+                color=TEXT,
+            )
+            provider_dd = ft.Dropdown(
+                label="Provider",
+                value=provider,
+                options=[ft.dropdown.Option(k, v["label"]) for k, v in config.PROVIDERS.items()],
+                width=240,
+                color=TEXT,
+                on_change=lambda e, t=tier: self._on_tier_provider_change(t),
+            )
+            self.tier_controls[tier] = {"provider": provider_dd, "model": model_dd}
+            tier_cards.append(
+                self._card(
+                    ft.Text(config.TIER_LABELS[tier], weight=ft.FontWeight.BOLD, color=TEXT),
+                    ft.Row([provider_dd, model_dd], wrap=True),
+                )
+            )
+
         self.set_anthropic = ft.TextField(
             label="Anthropic API key", value=db.get_setting(config.SETTING_ANTHROPIC_KEY),
             password=True, can_reveal_password=True, color=TEXT, width=480,
@@ -1226,10 +1241,18 @@ class AppUI:
         )
 
         self._set_content(
-            self._section_title("Settings", "API keys are stored locally in the encrypted-at-rest app database."),
+            self._section_title(
+                "Settings",
+                "Route each task to the model it does best. Keys are stored locally only.",
+            ),
             self._card(
-                self.set_provider,
-                self.set_model,
+                ft.Text("Model routing by task tier", weight=ft.FontWeight.BOLD, color=TEXT),
+                ft.Text(
+                    "Defaults: extraction → Gemini 3.5 Flash · medium → Sonnet 4.6 "
+                    "(Opus 4.6 / Gemini 3.1 Pro also good here) · heavy → Opus 4.8.",
+                    size=12, color=MUTED,
+                ),
+                *tier_cards,
             ),
             self._card(
                 ft.Text("Cloud LLM keys", weight=ft.FontWeight.BOLD, color=TEXT),
@@ -1245,17 +1268,19 @@ class AppUI:
             ft.FilledButton("Save settings", icon="save", on_click=self._save_settings),
         )
 
-    def _on_provider_change(self, e: ft.ControlEvent) -> None:
-        provider = e.control.value
-        self.set_model.options = [
-            ft.dropdown.Option(m) for m in config.PROVIDERS[provider]["models"]
-        ]
-        self.set_model.value = config.PROVIDERS[provider]["default_model"]
+    def _on_tier_provider_change(self, tier: str) -> None:
+        controls = self.tier_controls[tier]
+        provider = controls["provider"].value
+        models = config.PROVIDERS[provider]["models"]
+        controls["model"].options = [ft.dropdown.Option(m) for m in models]
+        controls["model"].value = config.PROVIDERS[provider]["default_model"]
         self.page.update()
 
     def _save_settings(self, e: ft.ControlEvent) -> None:
-        db.set_setting(config.SETTING_ACTIVE_PROVIDER, self.set_provider.value)
-        db.set_setting(config.SETTING_ACTIVE_MODEL, self.set_model.value)
+        for tier, controls in self.tier_controls.items():
+            pkey, mkey = config.tier_setting_keys(tier)
+            db.set_setting(pkey, controls["provider"].value)
+            db.set_setting(mkey, controls["model"].value)
         db.set_setting(config.SETTING_ANTHROPIC_KEY, self.set_anthropic.value.strip())
         db.set_setting(config.SETTING_OPENAI_KEY, self.set_openai.value.strip())
         db.set_setting(config.SETTING_GEMINI_KEY, self.set_gemini.value.strip())

@@ -26,6 +26,33 @@ explicitly configure.
 
 ---
 
+## Model routing (task tiers)
+
+Work is routed to the model best suited to each task. The three tiers are
+configurable in **Settings**; the defaults are:
+
+| Tier | Default model | Used for |
+|------|---------------|----------|
+| **extraction** | **Gemini 3.5 Flash** | Multimodal parsing / OCR of PDFs and images, including **large, image-heavy PDFs** (hundreds of pages/photos) and plain-text files |
+| **medium** | **Sonnet 4.6** (Opus 4.6 / Gemini 3.1 Pro also recommended) | Fact extraction, the Inconsistency Matrix, the research loop, OSINT summaries, deadlines, cross-exam, intake, chat |
+| **heavy** | **Opus 4.8** | The single most demanding task — final brief / motion drafting |
+
+**Large, image-heavy PDFs** are handled by splitting the file into page batches
+(`config.PDF_PAGE_BATCH`, default 15) and sending each batch to the extraction
+model, which OCRs scanned pages and *describes embedded photographs/exhibits*.
+Every batch's output is concatenated and then chunked into the local RAG store,
+so nothing is dropped. Fact extraction then sweeps the **entire** parsed
+document in windows (`config.FACT_WINDOW_CHARS`) rather than just the first few
+thousand characters. If no Gemini key is set, PDFs fall back to local `pypdf`
+text extraction and images to an EXIF-only description.
+
+The app assumes you have access to all Gemini models (Google AI Pro / Vertex AI)
+and all Anthropic models (Pro plan). Exact Gemini model ID strings differ
+slightly between AI Studio and Vertex — if a configured ID is rejected, adjust
+it in **Settings → Model routing**.
+
+---
+
 ## Pre-Flight Report (bugs caught and fixed during pre-debugging)
 
 These issues were traced and fixed *before* shipping the code:
@@ -79,6 +106,20 @@ These issues were traced and fixed *before* shipping the code:
     (`anthropic`/`openai`/`google-generativeai`) and parsers (`pypdf`/`Pillow`/
     `python-docx`/`playwright`) are imported lazily with clear "package not
     installed" messages, so the app runs with only the providers you use.
+
+11. **Large PDFs silently truncated.** The first design extracted only the text
+    layer and capped fact extraction at ~12k characters, so scanned/image pages
+    produced nothing and long files lost most of their facts. **Fix:** PDFs and
+    images go through the multimodal extraction tier (Gemini), big PDFs are
+    page-batched so each request stays under the output-token cap, image pages
+    are OCR'd and embedded photos described, and fact extraction sweeps the whole
+    document in windows. Output-token overflow on dense pages is avoided by the
+    small per-batch page count.
+
+12. **Wrong model for the job / cost blow-ups.** A single "active model" used
+    Opus for everything. **Fix:** task-tiered routing — cheap fast Gemini Flash
+    for high-volume parsing, mid models for everyday reasoning, and Opus 4.8
+    reserved for the heaviest synthesis (brief drafting) only.
 
 ---
 

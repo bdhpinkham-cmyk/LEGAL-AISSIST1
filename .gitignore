@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Local app data / secrets (never commit case data or API keys)
+*.db
+*.sqlite3
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

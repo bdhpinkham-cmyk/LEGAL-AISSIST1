@@ -1,0 +1,24 @@
+# ---------------------------------------------------------------------------
+# Pro Se Legal Intelligence — dependencies
+# ---------------------------------------------------------------------------
+# Core UI framework (desktop .exe + Android .apk via `flet build`).
+flet==0.24.1
+
+# HTTP client used for CourtListener, Tavily/DuckDuckGo, Deepgram, Whisper.
+requests==2.32.3
+
+# Cloud LLM SDKs (the router imports lazily; install only what you use).
+anthropic==0.39.0
+openai==1.54.4
+google-generativeai==0.8.3
+
+# Evidence ingestion.
+pypdf==5.1.0            # PDF text extraction
+Pillow==11.0.0         # image EXIF / GPS metadata extraction
+
+# Court-ready document export onto numbered pleading paper.
+python-docx==1.1.2
+
+# Autonomous Court Portal Agent (browser automation).
+# After installing, run once:  playwright install chromium
+playwright==1.48.0

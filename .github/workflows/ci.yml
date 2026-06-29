@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Compile & smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Byte-compile all modules (syntax check)
+        run: python -m compileall -q .
+
+      - name: Install minimal runtime deps for the smoke test
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run smoke test (core logic, no GUI / cloud SDKs)
+        run: python tests/smoke_test.py

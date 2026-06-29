@@ -186,7 +186,8 @@ RAG_TOP_K = 6
 # the multimodal extraction model (Gemini). Keeping the batch small keeps each
 # response under the model's output-token cap even for dense, scanned pages.
 PDF_PAGE_BATCH = 15            # pages per multimodal extraction request
-PDF_MAX_BATCHES = 400          # safety cap (=> up to 6,000 pages per file)
+PDF_MAX_BATCHES = 2000         # safety cap (=> up to 30,000 pages per file)
+PDF_BATCH_MAX_RETRIES = MAX_API_RETRIES  # retries per batch before recording a gap
 GEMINI_EXTRACT_MAX_TOKENS = 8192
 GEMINI_UPLOAD_POLL_SECONDS = 2.0
 GEMINI_UPLOAD_POLL_MAX = 120   # ~4 minutes of processing wait per upload
@@ -195,3 +196,19 @@ GEMINI_UPLOAD_POLL_MAX = 120   # ~4 minutes of processing wait per upload
 # dropped on long files (the model is called once per window, bounded by the cap).
 FACT_WINDOW_CHARS = 15000
 FACT_MAX_WINDOWS = 40
+
+# Audio/video chunking: large recordings are sliced into segments before being
+# sent to the transcription API (avoids size caps and lets gaps be tracked
+# per-segment instead of failing the whole file).
+AUDIO_CHUNK_SECONDS = 600           # 10-minute segments
+AUDIO_CHUNK_OVERLAP_SECONDS = 0     # timestamped headers make boundaries unambiguous
+AUDIO_MAX_CHUNKS = 60               # ~10 hours per file
+AUDIO_SIZE_LIMIT_BYTES = 24 * 1024 * 1024  # below this, send the file whole
+
+# Folder ingestion (Discovery & Timeline "Add evidence folder…").
+FOLDER_MAX_FILES = 5000
+FOLDER_SKIP_EXTENSIONS = {".exe", ".dll", ".zip", ".rar", ".7z", ".ds_store", ".ini", ".tmp", ".lnk"}
+
+# Case-identifying fields that the ingestion engine fills in live as evidence
+# is parsed (only ever writes into fields that are currently empty).
+CASE_FIELD_KEYS = ("name", "court", "case_number", "judge", "jurisdiction", "charges")

@@ -25,10 +25,11 @@ The Court Portal browser-automation agent lives in ``automation.py``.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 
@@ -70,12 +71,19 @@ class DiscoveryTimelineEngine:
     ) -> Dict[str, Any]:
         """Ingest one evidence file end-to-end.
 
-        Returns a summary dict: {document_id, char_count, metadata, facts_added}.
+        Returns a summary dict: {document_id, char_count, metadata, facts_added,
+        doc_type, gaps, units_expected, units_processed, case_fields_applied}.
+        ``gaps`` lists any page range / audio segment that could not be
+        extracted even after retries — nothing is dropped silently, it is
+        surfaced here instead.
         """
         lower = filename.lower()
         metadata: Dict[str, str] = {}
         doc_type = "document"
         content = ""
+        gaps: List[Dict[str, Any]] = []
+        units_expected: Optional[int] = None
+        units_processed: Optional[int] = None
 
         # The extraction tier (default Gemini 3.5 Flash) handles multimodal OCR.
         extraction = self.router.resolve(config.TIER_EXTRACTION)
@@ -85,28 +93,46 @@ class DiscoveryTimelineEngine:
             log("Extracting image metadata (EXIF / GPS)…")
             metadata = extract_image_metadata(path)
             log("Reading image (OCR + visual description)…")
-            visual = extract_document(path, filename, extraction, log=log)
+            visual, gaps = extract_document(path, filename, extraction, log=log)
             content = self._describe_image_metadata(filename, metadata) + "\n\n" + visual
         elif lower.endswith(
             (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".mp4", ".mov", ".m4v", ".webm")
         ):
             doc_type = "media"
             log("Transcribing audio/video (this can take a while)…")
-            content = transcribe_audio(
+            content, gaps = transcribe_audio(
                 path,
                 deepgram_key=db.get_setting(config.SETTING_DEEPGRAM_KEY),
                 openai_key=db.get_setting(config.SETTING_OPENAI_KEY),
+                log=log,
             )
         else:
             doc_type = "pdf" if lower.endswith(".pdf") else "document"
             log("Parsing document (multimodal OCR for scanned/image pages)…")
-            content = extract_document(path, filename, extraction, log=log)
+            content, gaps = extract_document(path, filename, extraction, log=log)
 
         if not content.strip():
             raise IngestionError(
                 f"No text could be extracted from {filename}. "
                 "If it is a scanned PDF it may need OCR."
             )
+
+        if gaps:
+            log(f"Warning: {len(gaps)} gap(s) in extracted content for {filename}.")
+
+        if doc_type == "pdf":
+            try:
+                from pypdf import PdfReader
+
+                units_expected = len(PdfReader(path).pages)
+                missing = sum(
+                    (g["end_page"] - g["start_page"] + 1)
+                    for g in gaps
+                    if "start_page" in g and "end_page" in g
+                )
+                units_processed = max(0, units_expected - missing)
+            except Exception:  # noqa: BLE001 — page count is informational only
+                units_expected = units_processed = None
 
         document_id = db.add_document(
             case_id, filename, path, doc_type, content, metadata
@@ -129,11 +155,20 @@ class DiscoveryTimelineEngine:
                 document_id=document_id,
             )
 
+        log("Checking for case-identifying fields (court, case number, judge…)…")
+        proposed_fields = self._extract_case_fields(content, filename, log=log)
+        case_fields_applied = self._merge_case_fields(case_id, proposed_fields, log=log)
+
         return {
             "document_id": document_id,
             "char_count": len(content),
             "metadata": metadata,
             "facts_added": len(facts),
+            "doc_type": doc_type,
+            "gaps": gaps,
+            "units_expected": units_expected,
+            "units_processed": units_processed,
+            "case_fields_applied": case_fields_applied,
         }
 
     def _describe_image_metadata(self, filename: str, metadata: Dict[str, str]) -> str:
@@ -189,6 +224,163 @@ class DiscoveryTimelineEngine:
                     seen.add(key)
                     cleaned.append(item)
         return cleaned
+
+    def _extract_case_fields(self, content: str, source: str, log: LogFn = _noop) -> Dict[str, str]:
+        """Sweep the document for case-identifying fields (court, case number, judge, …).
+
+        Mirrors ``_extract_facts``'s windowed sweep so nothing past the first
+        excerpt is missed. Never invents a value — only returns fields the
+        model found explicitly stated in the text.
+        """
+        window = config.FACT_WINDOW_CHARS
+        windows = [content[i : i + window] for i in range(0, len(content), window)]
+        windows = windows[: config.FACT_MAX_WINDOWS]
+        keys = config.CASE_FIELD_KEYS
+        found: Dict[str, str] = {}
+        for idx, excerpt in enumerate(windows, 1):
+            if len(found) == len(keys):
+                break
+            if len(windows) > 1:
+                log(f"Scanning for case info (section {idx}/{len(windows)})…")
+            prompt = (
+                "Identify any of the following case-identifying fields that are "
+                f"explicitly stated in this evidence excerpt: {', '.join(keys)}. "
+                "Return a JSON object using only the keys you are confident are "
+                "present, each mapped to its exact value as written. Do not guess "
+                "or invent a value; omit any key you cannot find verbatim.\n\n"
+                f"SOURCE: {source}\n\nEVIDENCE EXCERPT:\n{excerpt}"
+            )
+            try:
+                data = self.router.complete_json(prompt, tier=config.TIER_MEDIUM, max_tokens=500)
+            except LLMError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            for key in keys:
+                value = data.get(key)
+                if isinstance(value, str) and value.strip() and key not in found:
+                    found[key] = value.strip()
+        return found
+
+    def _merge_case_fields(
+        self, case_id: int, proposed: Dict[str, str], log: LogFn = _noop
+    ) -> Dict[str, str]:
+        """Apply ``proposed`` fields, but only into currently-empty case fields.
+
+        A later document that disagrees with an already-filled field is logged
+        as a conflict, never applied — this avoids a possibly-wrong OCR guess
+        overwriting a value the user entered or a prior extraction confirmed.
+        """
+        if not proposed:
+            return {}
+        case = db.get_case(case_id) or {}
+        to_write: Dict[str, str] = {}
+        for key, value in proposed.items():
+            if key not in config.CASE_FIELD_KEYS:
+                continue
+            current = str(case.get(key, "") or "").strip()
+            if current:
+                if current.lower() != value.strip().lower():
+                    log(f"Field conflict: {key} already set to '{current}'; keeping existing.")
+                continue
+            to_write[key] = value
+        if to_write:
+            db.update_case(case_id, **to_write)
+            log(f"Case info updated: {', '.join(to_write.keys())}.")
+        return to_write
+
+    def _should_skip_file(self, filename: str) -> bool:
+        ext = os.path.splitext(filename.lower())[1]
+        return ext in config.FOLDER_SKIP_EXTENSIONS
+
+    def ingest_folder(
+        self,
+        case_id: int,
+        folder_path: str,
+        log: LogFn = _noop,
+        on_field_update: Optional[Callable[[Dict[str, str]], None]] = None,
+    ) -> Dict[str, Any]:
+        """Walk a folder (recursively) and ingest every supported file.
+
+        Reuses ``ingest_file`` for every file — no duplicated dispatch logic.
+        A failure on one file is recorded and the run continues; it never
+        aborts the whole folder. Returns a coverage-report dict.
+        """
+        discovered: List[Tuple[str, str]] = []
+        for root, dirs, files in os.walk(folder_path):
+            dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d != "__pycache__")
+            for name in files:
+                if name.startswith("."):
+                    continue
+                discovered.append((os.path.join(root, name), name))
+        discovered.sort(key=lambda t: t[0])
+
+        skipped: List[Dict[str, str]] = []
+        to_process: List[Tuple[str, str]] = []
+        for path, name in discovered:
+            if self._should_skip_file(name):
+                log(f"Skipping {name} (unsupported file type).")
+                skipped.append({"filename": name, "reason": "unsupported file type"})
+            else:
+                to_process.append((path, name))
+
+        if len(to_process) > config.FOLDER_MAX_FILES:
+            log(
+                f"Folder has {len(to_process)} eligible files; processing the first "
+                f"{config.FOLDER_MAX_FILES} (FOLDER_MAX_FILES cap)."
+            )
+            for path, name in to_process[config.FOLDER_MAX_FILES:]:
+                skipped.append({"filename": name, "reason": "exceeded FOLDER_MAX_FILES cap"})
+            to_process = to_process[: config.FOLDER_MAX_FILES]
+
+        files_succeeded = 0
+        failed: List[Dict[str, str]] = []
+        all_gaps: List[Dict[str, Any]] = []
+        case_fields_applied: Dict[str, str] = {}
+        pages_expected = 0
+        pages_processed = 0
+        have_page_counts = False
+
+        log(f"Ingesting {len(to_process)} file(s) from {folder_path}…")
+        for path, name in to_process:
+            log(f"Ingesting {name}…")
+            try:
+                summary = self.ingest_file(case_id, path, name, log=log)
+            except (IngestionError, LLMError) as exc:
+                log(f"{name}: {exc}")
+                failed.append({"filename": name, "reason": str(exc)})
+                continue
+            except Exception as exc:  # noqa: BLE001 — one bad file must not abort the run
+                log(f"{name}: unexpected error: {exc}")
+                failed.append({"filename": name, "reason": str(exc)})
+                continue
+
+            files_succeeded += 1
+            all_gaps.extend({**g, "filename": name} for g in summary.get("gaps") or [])
+            if summary.get("units_expected") is not None:
+                have_page_counts = True
+                pages_expected += summary["units_expected"]
+                pages_processed += summary.get("units_processed") or 0
+            applied = summary.get("case_fields_applied") or {}
+            if applied:
+                case_fields_applied.update(applied)
+                if on_field_update:
+                    on_field_update(applied)
+
+        log(
+            f"Folder ingestion complete: {files_succeeded}/{len(to_process)} files, "
+            f"{len(skipped)} skipped, {len(failed)} failed."
+        )
+        return {
+            "files_total": len(to_process),
+            "files_succeeded": files_succeeded,
+            "files_failed": failed,
+            "files_skipped": skipped,
+            "pages_expected": pages_expected if have_page_counts else None,
+            "pages_processed": pages_processed if have_page_counts else None,
+            "gaps": all_gaps,
+            "case_fields_applied": case_fields_applied,
+        }
 
     def analyze_inconsistencies(self, case_id: int, log: LogFn = _noop) -> int:
         """Compare all timeline facts and flag contradictions. Returns flag count."""

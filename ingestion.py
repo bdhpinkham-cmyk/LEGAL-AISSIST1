@@ -110,7 +110,7 @@ def extract_document(
     filename: str,
     extraction: tuple,
     log=lambda _m: None,
-) -> str:
+) -> Tuple[str, List[Dict]]:
     """Extract text from a file, using multimodal OCR for PDFs/images.
 
     ``extraction`` is the (provider, model, api_key) tuple for the extraction
@@ -119,6 +119,10 @@ def extract_document(
     multimodal path is unavailable (no Gemini key, or a non-Gemini extraction
     provider), PDFs fall back to local ``pypdf`` text extraction and images fall
     back to an EXIF description.
+
+    Returns ``(text, gaps)`` — ``gaps`` describes any page range that could not
+    be extracted even after retries, so callers can surface a visible coverage
+    report instead of silently losing content.
     """
     import gemini_client
 
@@ -130,26 +134,26 @@ def extract_document(
     if ext == ".pdf":
         if gemini_ready:
             try:
-                text = gemini_extract_pdf(path, model, key, log=log)
+                text, gaps = gemini_extract_pdf(path, model, key, log=log)
                 if text.strip():
-                    return text
+                    return text, gaps
                 log("Multimodal extraction returned nothing; falling back to text layer.")
             except IngestionError as exc:
                 log(f"Multimodal PDF extraction failed ({exc}); using local text layer.")
-        return _extract_pdf(path)
+        return _extract_pdf(path), []
 
     if ext in _IMAGE_MIME:
         if gemini_ready:
             try:
-                return gemini_extract_image(path, model, key)
+                return gemini_extract_image(path, model, key), []
             except IngestionError as exc:
                 log(f"Multimodal image extraction failed ({exc}).")
         meta = extract_image_metadata(path)
         return "Image evidence (no multimodal model configured).\n" + "\n".join(
             f"{k}: {v}" for k, v in meta.items()
-        )
+        ), []
 
-    return extract_text(path)
+    return extract_text(path), []
 
 
 def gemini_extract_image(path: str, model: str, key: str = "") -> str:
@@ -167,13 +171,22 @@ def gemini_extract_image(path: str, model: str, key: str = "") -> str:
         raise IngestionError(str(exc)) from exc
 
 
-def gemini_extract_pdf(path: str, model: str, key: str = "", log=lambda _m: None) -> str:
+def gemini_extract_pdf(
+    path: str, model: str, key: str = "", log=lambda _m: None
+) -> Tuple[str, List[Dict]]:
     """Extract a (potentially huge, image-heavy) PDF via Gemini, page-batched.
 
     The PDF is split into ``PDF_PAGE_BATCH``-page chunks so each multimodal call
     stays under the model's output-token cap even for dense scanned pages, and so
     each inline payload stays small (works on both AI Studio and Vertex). Every
     batch's text is concatenated, then the caller chunks it into the RAG store.
+
+    Each batch is retried (``PDF_BATCH_MAX_RETRIES``, exponential backoff)
+    before being given up on. A batch that still fails leaves a visible
+    ``FAILED TO EXTRACT`` marker in the returned text and a matching entry in
+    the returned ``gaps`` list — nothing is dropped silently. Pages beyond the
+    ``PDF_MAX_BATCHES`` cap are likewise recorded as a gap rather than an
+    unflagged truncation.
     """
     try:
         from pypdf import PdfReader, PdfWriter
@@ -190,38 +203,64 @@ def gemini_extract_pdf(path: str, model: str, key: str = "", log=lambda _m: None
 
     batch = max(1, config.PDF_PAGE_BATCH)
     n_batches = (n_pages + batch - 1) // batch
+    gaps: List[Dict] = []
     if n_batches > config.PDF_MAX_BATCHES:
+        skipped_start = config.PDF_MAX_BATCHES * batch + 1
         log(
             f"PDF has {n_pages} pages; processing the first "
             f"{config.PDF_MAX_BATCHES * batch} pages."
         )
+        gaps.append({
+            "start_page": skipped_start,
+            "end_page": n_pages,
+            "reason": f"exceeded PDF_MAX_BATCHES cap ({config.PDF_MAX_BATCHES} batches)",
+        })
         n_batches = config.PDF_MAX_BATCHES
 
     log(f"Parsing {n_pages}-page PDF in {n_batches} batch(es) of {batch} pages…")
     out_parts: List[str] = []
+    succeeded = 0
 
     for b in range(n_batches):
         start = b * batch
         end = min(start + batch, n_pages)
         log(f"  Extracting pages {start + 1}-{end} (batch {b + 1}/{n_batches})…")
         tmp_path = _write_pdf_subset(reader, PdfWriter, start, end)
+        prompt = (
+            f"{_PDF_EXTRACT_PROMPT}\n\n(This is pages {start + 1}-{end} of a "
+            f"{n_pages}-page document.)"
+        )
+        text = ""
+        last_exc: Optional[Exception] = None
         try:
-            prompt = (
-                f"{_PDF_EXTRACT_PROMPT}\n\n(This is pages {start + 1}-{end} of a "
-                f"{n_pages}-page document.)"
-            )
-            text = gemini_client.generate_from_file(
-                model, tmp_path, _PDF_MIME, prompt,
-                max_tokens=config.GEMINI_EXTRACT_MAX_TOKENS,
-            )
-            if text:
-                out_parts.append(f"=== PAGES {start + 1}-{end} ===\n{text}")
-        except gemini_client.GeminiError as exc:
-            log(f"  Batch {b + 1} failed: {exc} (continuing)")
+            for attempt in range(config.PDF_BATCH_MAX_RETRIES):
+                try:
+                    text = gemini_client.generate_from_file(
+                        model, tmp_path, _PDF_MIME, prompt,
+                        max_tokens=config.GEMINI_EXTRACT_MAX_TOKENS,
+                    )
+                    last_exc = None
+                    break
+                except gemini_client.GeminiError as exc:
+                    last_exc = exc
+                    if attempt < config.PDF_BATCH_MAX_RETRIES - 1:
+                        log(f"  Batch {b + 1} attempt {attempt + 1} failed: {exc} (retrying)")
+                        time.sleep(config.RETRY_BASE_DELAY * (2 ** attempt))
         finally:
             _safe_unlink(tmp_path)
 
-    return "\n\n".join(out_parts).strip()
+        if last_exc is not None:
+            reason = str(last_exc)
+            log(f"  Batch {b + 1} failed after {config.PDF_BATCH_MAX_RETRIES} attempt(s): {reason}")
+            out_parts.append(f"=== PAGES {start + 1}-{end} FAILED TO EXTRACT ({reason}) ===")
+            gaps.append({"start_page": start + 1, "end_page": end, "reason": reason})
+        else:
+            succeeded += 1
+            if text:
+                out_parts.append(f"=== PAGES {start + 1}-{end} ===\n{text}")
+
+    log(f"PDF parsed: {succeeded}/{n_batches} batches succeeded.")
+    return "\n\n".join(out_parts).strip(), gaps
 
 
 def _write_pdf_subset(reader, writer_cls, start: int, end: int) -> str:
@@ -310,17 +349,131 @@ def _parse_gps(gps: Dict) -> Optional[Tuple[str, str]]:
 # ---------------------------------------------------------------------------
 # Audio / video transcription
 # ---------------------------------------------------------------------------
+def _chunk_boundaries(total_ms: int, chunk_ms: int) -> List[Tuple[int, int]]:
+    """Pure helper: split [0, total_ms) into consecutive (start_ms, end_ms) spans."""
+    if total_ms <= 0:
+        return [(0, 0)]
+    chunk_ms = max(1, chunk_ms)
+    bounds: List[Tuple[int, int]] = []
+    start = 0
+    while start < total_ms:
+        end = min(start + chunk_ms, total_ms)
+        bounds.append((start, end))
+        start = end
+    return bounds
+
+
+def _fmt_hms(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def split_audio(
+    path: str,
+    chunk_seconds: int = config.AUDIO_CHUNK_SECONDS,
+    log=lambda _m: None,
+) -> List[Tuple[str, float, float]]:
+    """Slice a large audio/video file into ``chunk_seconds`` segments.
+
+    Returns a list of ``(chunk_path, start_seconds, end_seconds)``. Files
+    already under ``AUDIO_SIZE_LIMIT_BYTES`` are returned unchanged as a single
+    segment — today's whole-file behavior is preserved exactly, and pydub is
+    never imported for the common case of short recordings. Raises
+    ``ImportError`` (propagated, not swallowed) if pydub isn't installed and
+    the file is actually large enough to require chunking; callers fall back
+    to whole-file transcription on that error.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+
+    if size and size <= config.AUDIO_SIZE_LIMIT_BYTES:
+        return [(path, 0.0, 0.0)]
+
+    from pydub import AudioSegment
+    import tempfile
+
+    audio = AudioSegment.from_file(path)
+    total_ms = len(audio)
+    chunk_ms = max(1000, int(chunk_seconds * 1000))
+    bounds = _chunk_boundaries(total_ms, chunk_ms)
+
+    if len(bounds) <= 1:
+        return [(path, 0.0, total_ms / 1000.0)]
+
+    if len(bounds) > config.AUDIO_MAX_CHUNKS:
+        log(
+            f"Audio is {_fmt_hms(total_ms / 1000.0)} long; only processing the first "
+            f"{config.AUDIO_MAX_CHUNKS} chunk(s) (~{_fmt_hms(config.AUDIO_MAX_CHUNKS * chunk_seconds)})."
+        )
+        bounds = bounds[: config.AUDIO_MAX_CHUNKS]
+
+    config.ensure_directories()
+    chunks: List[Tuple[str, float, float]] = []
+    for start_ms, end_ms in bounds:
+        segment = audio[start_ms:end_ms]
+        fd, tmp_path = tempfile.mkstemp(suffix=".mp3", dir=str(config.DATA_ROOT))
+        os.close(fd)
+        segment.export(tmp_path, format="mp3")
+        chunks.append((tmp_path, start_ms / 1000.0, end_ms / 1000.0))
+    return chunks
+
+
 def transcribe_audio(
-    path: str, deepgram_key: str = "", openai_key: str = ""
-) -> str:
-    """Transcribe an audio/video file. Prefers Deepgram, falls back to Whisper."""
-    if deepgram_key:
-        return _transcribe_deepgram(path, deepgram_key)
-    if openai_key:
-        return _transcribe_whisper(path, openai_key)
-    raise IngestionError(
-        "Transcription requires a Deepgram or OpenAI API key (set one in Settings)."
-    )
+    path: str,
+    deepgram_key: str = "",
+    openai_key: str = "",
+    log=lambda _m: None,
+) -> Tuple[str, List[Dict]]:
+    """Transcribe an audio/video file. Prefers Deepgram, falls back to Whisper.
+
+    Large files are sliced into ``AUDIO_CHUNK_SECONDS`` segments first (see
+    ``split_audio``) so no single request exceeds the transcription API's size
+    limits and a failed segment doesn't abort the whole recording. Each
+    chunk's text is prefixed with a ``=== TIME hh:mm:ss-hh:mm:ss ===`` header.
+    Returns ``(transcript, gaps)``; a chunk whose retries are exhausted is
+    recorded as a gap rather than aborting the file.
+    """
+    if not deepgram_key and not openai_key:
+        raise IngestionError(
+            "Transcription requires a Deepgram or OpenAI API key (set one in Settings)."
+        )
+
+    def _transcribe_one(chunk_path: str) -> str:
+        if deepgram_key:
+            return _transcribe_deepgram(chunk_path, deepgram_key)
+        return _transcribe_whisper(chunk_path, openai_key)
+
+    try:
+        chunks = split_audio(path, log=log)
+    except ImportError:
+        log("Audio chunking unavailable (pydub/ffmpeg not found); sending whole file.")
+        chunks = [(path, 0.0, 0.0)]
+
+    if len(chunks) == 1 and chunks[0][0] == path:
+        return _transcribe_one(path), []
+
+    log(f"Transcribing audio in {len(chunks)} chunk(s)…")
+    out_parts: List[str] = []
+    gaps: List[Dict] = []
+    for i, (chunk_path, start_s, end_s) in enumerate(chunks):
+        log(f"  Transcribing {_fmt_hms(start_s)}-{_fmt_hms(end_s)} (chunk {i + 1}/{len(chunks)})…")
+        try:
+            text = _transcribe_one(chunk_path)
+            if text:
+                out_parts.append(f"=== TIME {_fmt_hms(start_s)}-{_fmt_hms(end_s)} ===\n{text}")
+        except IngestionError as exc:
+            log(f"  Chunk {i + 1} failed: {exc}")
+            gaps.append({"start_s": start_s, "end_s": end_s, "reason": str(exc)})
+        finally:
+            if chunk_path != path:
+                _safe_unlink(chunk_path)
+
+    log(f"Audio parsed: {len(chunks) - len(gaps)}/{len(chunks)} chunks succeeded.")
+    return "\n\n".join(out_parts).strip(), gaps
 
 
 def _transcribe_deepgram(path: str, key: str) -> str:

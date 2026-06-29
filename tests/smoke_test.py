@@ -26,6 +26,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config  # noqa: E402
 import database as db  # noqa: E402
 import gemini_client  # noqa: E402
+import ingestion  # noqa: E402
+from agents import DiscoveryTimelineEngine  # noqa: E402
 from ingestion import redact_pii  # noqa: E402
 from llm_router import LLMRouter, _extract_json  # noqa: E402
 from rag import RAGStore  # noqa: E402
@@ -86,6 +88,28 @@ def main() -> None:
     check("draft saved with export path", db.list_drafts(c1)[0]["export_path"] == "/tmp/out.docx")
     db.set_setting("last_case_id", str(c1))
     check("last-case setting persists", db.get_setting("last_case_id") == str(c1))
+
+    # --- Audio chunk-boundary math (pure helper, no pydub required) --------
+    check("chunk boundaries: evenly divisible",
+          ingestion._chunk_boundaries(6000, 2000) == [(0, 2000), (2000, 4000), (4000, 6000)])
+    check("chunk boundaries: non-evenly-divisible tail",
+          ingestion._chunk_boundaries(5000, 2000) == [(0, 2000), (2000, 4000), (4000, 5000)])
+    check("ingestion imports fine without pydub installed at module load",
+          "split_audio" in dir(ingestion))
+
+    # --- Folder-walk skip classification ------------------------------------
+    engine = DiscoveryTimelineEngine(LLMRouter())
+    check("folder skip: .zip is skipped", engine._should_skip_file("evidence.zip") is True)
+    check("folder skip: .pdf is not skipped", engine._should_skip_file("evidence.pdf") is False)
+
+    # --- Case-field merge-only-empty logic -----------------------------------
+    c3 = db.create_case("Case C", court="Original Superior Court")
+    applied = engine._merge_case_fields(c3, {"court": "Different Court", "judge": "Hon. Smith"})
+    check("merge: existing non-empty field is NOT overwritten", "court" not in applied)
+    check("merge: empty field IS filled", applied.get("judge") == "Hon. Smith")
+    check("merge: db reflects only the filled field",
+          db.get_case(c3)["court"] == "Original Superior Court"
+          and db.get_case(c3)["judge"] == "Hon. Smith")
 
     # --- Tier routing -------------------------------------------------------
     r = LLMRouter()

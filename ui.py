@@ -89,7 +89,8 @@ class AppUI:
         # File pickers (registered once so the overlay isn't duplicated on re-render).
         self.evidence_picker = ft.FilePicker(on_result=self._on_evidence_picked)
         self.sa_picker = ft.FilePicker(on_result=self._on_sa_picked)
-        self.page.overlay.extend([self.evidence_picker, self.sa_picker])
+        self.folder_picker = ft.FilePicker(on_result=self._on_folder_picked)
+        self.page.overlay.extend([self.evidence_picker, self.sa_picker, self.folder_picker])
 
         self.content = ft.Column(expand=True, scroll=ft.ScrollMode.AUTO, spacing=12)
         self._build_shell()
@@ -640,8 +641,16 @@ class AppUI:
         self.discovery_log = self._new_log(160)
         self.timeline_container = ft.Column(spacing=0)
         self.evidence_container = ft.Column(spacing=4)
+        self.case_info_fields = {
+            key: ft.Text("—", color=TEXT, size=13, selectable=True)
+            for key in config.CASE_FIELD_KEYS
+        }
+        self.coverage_container = ft.Column(
+            [ft.Text("No ingestion run yet.", color=MUTED, size=12)], spacing=4
+        )
         self._render_timeline()
         self._render_evidence()
+        self._render_case_info()
 
         self._set_content(
             self._section_title(
@@ -660,6 +669,11 @@ class AppUI:
                             ),
                         ),
                         ft.OutlinedButton(
+                            "Add evidence folder…",
+                            icon="folder_open",
+                            on_click=lambda e: self.folder_picker.get_directory_path(),
+                        ),
+                        ft.OutlinedButton(
                             "Run Inconsistency Matrix",
                             icon="rule",
                             on_click=self._run_inconsistency,
@@ -675,6 +689,30 @@ class AppUI:
                 self.discovery_log,
             ),
             self._card(
+                ft.Text("Current case info", weight=ft.FontWeight.BOLD, color=TEXT),
+                ft.Text(
+                    "Fills in automatically as evidence is parsed (never overwrites a "
+                    "value you've already entered).",
+                    size=11, color=MUTED,
+                ),
+                *[
+                    ft.Row(
+                        [
+                            ft.Container(
+                                ft.Text(key.replace("_", " ").title(), color=MUTED, size=12),
+                                width=120,
+                            ),
+                            self.case_info_fields[key],
+                        ]
+                    )
+                    for key in config.CASE_FIELD_KEYS
+                ],
+            ),
+            self._card(
+                ft.Text("Coverage report", weight=ft.FontWeight.BOLD, color=TEXT),
+                self.coverage_container,
+            ),
+            self._card(
                 ft.Text("Evidence on file", weight=ft.FontWeight.BOLD, color=TEXT),
                 self.evidence_container,
             ),
@@ -684,6 +722,83 @@ class AppUI:
                 self.timeline_container,
             ),
         )
+
+    def _render_case_info(self) -> None:
+        case = (db.get_case(self.case_id) if self.case_id else None) or {}
+        for key, text_ctrl in self.case_info_fields.items():
+            text_ctrl.value = case.get(key) or "—"
+        try:
+            self.page.update()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _apply_live_case_fields(self, applied: Dict[str, str]) -> None:
+        """Live-fill the case-info card from a background ingestion thread.
+
+        Mirrors ``_log_to``'s proven pattern of mutating a control and calling
+        ``page.update()`` directly from a daemon thread.
+        """
+        if not applied:
+            return
+        for key, value in applied.items():
+            ctrl = self.case_info_fields.get(key)
+            if ctrl is not None:
+                ctrl.value = value
+        try:
+            self.page.update()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _render_coverage_report(self, report: Dict) -> None:
+        gaps = report.get("gaps") or []
+        files_failed = report.get("files_failed") or []
+        files_skipped = report.get("files_skipped") or []
+        ok = not gaps and not files_failed
+
+        parts = []
+        if report.get("files_total") is not None:
+            parts.append(f"{report.get('files_succeeded', 0)}/{report.get('files_total', 0)} files")
+        if report.get("pages_expected") is not None:
+            parts.append(f"{report.get('pages_processed', 0)}/{report.get('pages_expected', 0)} pages")
+        parts.append(f"{len(gaps)} gap(s)")
+        summary_line = ", ".join(parts) + (" — fully parsed." if ok else " — see details below.")
+
+        controls: List[ft.Control] = [
+            ft.Row(
+                [
+                    ft.Icon("check_circle" if ok else "warning", color=OK if ok else WARN, size=18),
+                    ft.Text(summary_line, color=TEXT if ok else WARN, size=13),
+                ]
+            )
+        ]
+        if files_skipped:
+            controls.append(ft.Text(
+                "Skipped: " + ", ".join(f"{f['filename']} ({f['reason']})" for f in files_skipped[:10]),
+                color=MUTED, size=11, selectable=True,
+            ))
+        if files_failed:
+            controls.append(ft.Text(
+                "Failed: " + ", ".join(f"{f['filename']} ({f['reason']})" for f in files_failed[:10]),
+                color=DANGER, size=11, selectable=True,
+            ))
+        if gaps:
+            gap_lines = []
+            for g in gaps[:15]:
+                if "start_page" in g:
+                    loc = f"pages {g['start_page']}-{g['end_page']}"
+                elif "start_s" in g:
+                    loc = f"{g['start_s']:.0f}s-{g['end_s']:.0f}s"
+                else:
+                    loc = "unknown range"
+                fname = f"{g.get('filename')}: " if g.get("filename") else ""
+                gap_lines.append(f"{fname}{loc} — {g.get('reason', '')}")
+            controls.append(ft.Text("\n".join(gap_lines), color=WARN, size=11, selectable=True))
+
+        self.coverage_container.controls = controls
+        try:
+            self.page.update()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _render_timeline(self) -> None:
         events = db.list_timeline(self.case_id) if self.case_id else []
@@ -784,8 +899,11 @@ class AppUI:
         log = self._log_to(self.discovery_log)
         files = [(f.path, f.name) for f in e.files if f.path]
 
-        def work() -> int:
+        def work() -> Dict:
             count = 0
+            files_failed: List[Dict[str, str]] = []
+            all_gaps: List[Dict] = []
+            case_fields_applied: Dict[str, str] = {}
             for path, name in files:
                 log(f"Ingesting {name}…")
                 try:
@@ -795,15 +913,57 @@ class AppUI:
                         f"{summary['char_count']} chars indexed."
                     )
                     count += 1
+                    all_gaps.extend({**g, "filename": name} for g in summary.get("gaps") or [])
+                    applied = summary.get("case_fields_applied") or {}
+                    if applied:
+                        case_fields_applied.update(applied)
+                        self._apply_live_case_fields(applied)
                 except (IngestionError, LLMError) as exc:
                     log(f"{name}: {exc}")
-            return count
+                    files_failed.append({"filename": name, "reason": str(exc)})
+            return {
+                "files_total": len(files),
+                "files_succeeded": count,
+                "files_failed": files_failed,
+                "files_skipped": [],
+                "pages_expected": None,
+                "pages_processed": None,
+                "gaps": all_gaps,
+                "case_fields_applied": case_fields_applied,
+            }
 
         def done(result, error) -> None:
             if error:
                 self.snack(f"Ingestion error: {error}", DANGER)
             else:
-                self.snack(f"Ingested {result} file(s).", OK)
+                self.snack(f"Ingested {result['files_succeeded']} file(s).", OK)
+                self._render_coverage_report(result)
+            self._render_timeline()
+            self._render_evidence()
+
+        self.run_bg(work, done)
+
+    def _on_folder_picked(self, e: ft.FilePickerResultEvent) -> None:
+        if not e.path or self.case_id is None:
+            return
+        log = self._log_to(self.discovery_log)
+        folder_path = e.path
+
+        def work() -> Dict:
+            return self.discovery.ingest_folder(
+                self.case_id, folder_path, log=log, on_field_update=self._apply_live_case_fields
+            )
+
+        def done(result, error) -> None:
+            if error:
+                self.snack(f"Folder ingestion error: {error}", DANGER)
+            else:
+                self.snack(
+                    f"Ingested {result['files_succeeded']}/{result['files_total']} "
+                    "file(s) from folder.",
+                    OK,
+                )
+                self._render_coverage_report(result)
             self._render_timeline()
             self._render_evidence()
 

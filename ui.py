@@ -26,6 +26,8 @@ Architecture / pre-debugging decisions
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import threading
 from datetime import date, datetime
 from typing import Callable, Dict, List, Optional
@@ -80,6 +82,10 @@ class AppUI:
         self._portal_event = threading.Event()
         self._portal_decision = True
 
+        # Global "busy" tracking so the header shows activity during background work.
+        self._busy = 0
+        self._busy_lock = threading.Lock()
+
         # File pickers (registered once so the overlay isn't duplicated on re-render).
         self.evidence_picker = ft.FilePicker(on_result=self._on_evidence_picked)
         self.sa_picker = ft.FilePicker(on_result=self._on_sa_picked)
@@ -87,7 +93,9 @@ class AppUI:
 
         self.content = ft.Column(expand=True, scroll=ft.ScrollMode.AUTO, spacing=12)
         self._build_shell()
+        self._restore_last_case()
         self.show_dashboard()
+        self._maybe_show_disclaimer()
 
     # ======================================================================
     # Shell / navigation
@@ -97,6 +105,24 @@ class AppUI:
         self.page.theme_mode = ft.ThemeMode.DARK
         self.page.bgcolor = BG
         self.page.padding = 0
+
+        # Reasonable desktop defaults (ignored on mobile / web).
+        try:
+            self.page.window.width = 1280
+            self.page.window.height = 860
+            self.page.window.min_width = 900
+            self.page.window.min_height = 600
+        except Exception:  # noqa: BLE001 - older Flet API / mobile
+            for attr, val in (
+                ("window_width", 1280),
+                ("window_height", 860),
+                ("window_min_width", 900),
+                ("window_min_height", 600),
+            ):
+                try:
+                    setattr(self.page, attr, val)
+                except Exception:  # noqa: BLE001
+                    pass
 
         nav_items = [
             ("dashboard", "Dashboard", self.show_dashboard),
@@ -108,6 +134,7 @@ class AppUI:
             ("alarm", "Procedural", self.show_procedural),
             ("dns", "Court Portal", self.show_portal),
             ("settings", "Settings", self.show_settings),
+            ("help_outline", "Help", self.show_help),
         ]
         self.nav_rail = ft.NavigationRail(
             selected_index=0,
@@ -143,6 +170,11 @@ class AppUI:
             bgcolor=SURFACE,
         )
 
+        # Thin global progress bar shown whenever background work is running.
+        self.progress = ft.ProgressBar(
+            value=None, color=ACCENT, bgcolor=SURFACE_2, visible=False
+        )
+
         body = ft.Row(
             [
                 self.nav_rail,
@@ -156,7 +188,7 @@ class AppUI:
             expand=True,
         )
 
-        self.page.add(ft.Column([header, body], expand=True, spacing=0))
+        self.page.add(ft.Column([header, self.progress, body], expand=True, spacing=0))
 
     def _provider_label(self) -> str:
         try:
@@ -168,9 +200,15 @@ class AppUI:
     # Generic helpers
     # ======================================================================
     def run_bg(self, work: Callable[[], object], on_done: Optional[Callable] = None) -> None:
-        """Run ``work`` on a daemon thread; call ``on_done(result, error)`` after."""
+        """Run ``work`` on a daemon thread; call ``on_done(result, error)`` after.
+
+        Maintains a busy counter so the header progress bar reflects whether any
+        background work is in flight — the user always sees that something is
+        happening, even across multiple concurrent operations.
+        """
 
         def runner() -> None:
+            self._begin_busy()
             try:
                 result = work()
                 if on_done:
@@ -180,8 +218,109 @@ class AppUI:
                     on_done(None, exc)
                 else:
                     self.snack(f"Error: {exc}", DANGER)
+            finally:
+                self._end_busy()
 
         threading.Thread(target=runner, daemon=True).start()
+
+    def _begin_busy(self) -> None:
+        with self._busy_lock:
+            self._busy += 1
+            show = self._busy > 0
+        self.progress.visible = show
+        try:
+            self.page.update()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _end_busy(self) -> None:
+        with self._busy_lock:
+            self._busy = max(0, self._busy - 1)
+            show = self._busy > 0
+        self.progress.visible = show
+        try:
+            self.page.update()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _open_path(self, path: str) -> None:
+        """Open a file or folder with the OS default handler (desktop only)."""
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as exc:  # noqa: BLE001
+            self.snack(f"Could not open: {exc}", DANGER)
+
+    def _set_active_case(self, case_id: Optional[int], name: str = "") -> None:
+        """Set the active case and remember it across launches."""
+        self.case_id = case_id
+        if case_id is None:
+            self.case_banner.value = "No case selected"
+            db.set_setting("last_case_id", "")
+        else:
+            self.case_banner.value = f"Case: {name}" if name else "Case selected"
+            db.set_setting("last_case_id", str(case_id))
+        try:
+            self.page.update()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _restore_last_case(self) -> None:
+        last = db.get_setting("last_case_id")
+        if not last:
+            return
+        try:
+            cid = int(last)
+        except ValueError:
+            return
+        case = db.get_case(cid)
+        if case:
+            self.case_id = cid
+            self.case_banner.value = f"Case: {case['name']}"
+
+    def _maybe_show_disclaimer(self) -> None:
+        if db.get_setting("disclaimer_accepted") == "yes":
+            return
+
+        def accept(_: ft.ControlEvent) -> None:
+            db.set_setting("disclaimer_accepted", "yes")
+            self._close_dialog(dlg)
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Welcome — please read"),
+            content=ft.Column(
+                [
+                    ft.Text(
+                        "This app gives you legal INFORMATION and drafting help — "
+                        "it is not a lawyer and does not give legal advice. It does "
+                        "not create an attorney-client relationship.",
+                        color=TEXT,
+                    ),
+                    ft.Text(
+                        "Always double-check deadlines and any document it drafts "
+                        "against your court's actual rules before you file.",
+                        color=TEXT,
+                    ),
+                    ft.Text(
+                        "Your case data stays on this device. AI features send text "
+                        "to the AI provider you set up in Settings.",
+                        color=MUTED, size=12,
+                    ),
+                ],
+                tight=True,
+                spacing=10,
+                width=460,
+            ),
+            actions=[ft.FilledButton("I understand", on_click=accept)],
+        )
+        self.page.dialog = dlg
+        dlg.open = True
+        self.page.update()
 
     def snack(self, message: str, color: str = SURFACE_2) -> None:
         self.page.snack_bar = ft.SnackBar(
@@ -257,10 +396,15 @@ class AppUI:
 
         deadlines_summary = self._deadline_summary()
 
-        self._set_content(
+        controls: List[ft.Control] = [
             self._section_title(
                 "Dashboard", "Manage workspaces and review upcoming deadlines."
-            ),
+            )
+        ]
+        if not self._any_model_configured():
+            controls.append(self._setup_banner())
+
+        controls.extend([
             ft.Row(
                 [
                     self._card(
@@ -295,6 +439,42 @@ class AppUI:
                 ft.Text("Deadline Tickler", size=16, weight=ft.FontWeight.BOLD, color=TEXT),
                 deadlines_summary,
             ),
+        ])
+        self._set_content(*controls)
+
+    def _any_model_configured(self) -> bool:
+        try:
+            return any(
+                self.router.is_configured(t)
+                for t in (config.TIER_EXTRACTION, config.TIER_MEDIUM, config.TIER_HEAVY)
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _setup_banner(self) -> ft.Control:
+        return ft.Container(
+            content=ft.Row(
+                [
+                    ft.Icon("info", color="#1A1200"),
+                    ft.Column(
+                        [
+                            ft.Text(
+                                "Finish setup: add your AI keys to enable the assistant.",
+                                color="#1A1200", weight=ft.FontWeight.BOLD,
+                            ),
+                            ft.Text(
+                                "Open Settings and paste an Anthropic and/or Gemini key "
+                                "(or configure Vertex AI). Until then, AI features are off.",
+                                color="#1A1200", size=12,
+                            ),
+                        ],
+                        spacing=2, expand=True,
+                    ),
+                    ft.FilledButton("Open Settings", on_click=lambda e: self.show_settings()),
+                ],
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            bgcolor=WARN, padding=14, border_radius=10,
         )
 
     def _deadline_summary(self) -> ft.Control:
@@ -324,10 +504,9 @@ class AppUI:
 
     def _on_case_selected(self, e: ft.ControlEvent) -> None:
         if e.control.value:
-            self.case_id = int(e.control.value)
-            case = db.get_case(self.case_id)
-            self.case_banner.value = f"Case: {case['name']}" if case else "No case selected"
-            self.page.update()
+            cid = int(e.control.value)
+            case = db.get_case(cid)
+            self._set_active_case(cid, case["name"] if case else "")
             self.show_dashboard()
 
     def _create_case(self, e: ft.ControlEvent) -> None:
@@ -342,8 +521,7 @@ class AppUI:
             jurisdiction=self.nc_jur.value.strip(),
             charges=self.nc_charges.value.strip(),
         )
-        self.case_id = cid
-        self.case_banner.value = f"Case: {self.nc_name.value.strip()}"
+        self._set_active_case(cid, self.nc_name.value.strip())
         self.snack("Case created.", OK)
         self.show_dashboard()
 
@@ -353,12 +531,11 @@ class AppUI:
             return
 
         def confirm(_: ft.ControlEvent) -> None:
-            db.delete_case(self.case_id)
             from rag import STORE
 
             STORE.reset_case(self.case_id)
-            self.case_id = None
-            self.case_banner.value = "No case selected"
+            db.delete_case(self.case_id)
+            self._set_active_case(None)
             dlg.open = False
             self.page.update()
             self.snack("Case deleted.", OK)
@@ -419,7 +596,7 @@ class AppUI:
 
         # Create or update the case from intake.
         if self.case_id is None:
-            self.case_id = db.create_case(
+            cid = db.create_case(
                 name=answers.get("name") or "Untitled case",
                 court=answers.get("court", ""),
                 case_number=answers.get("case_number", ""),
@@ -427,7 +604,7 @@ class AppUI:
                 jurisdiction=answers.get("jurisdiction", ""),
                 charges=answers.get("charges", ""),
             )
-            self.case_banner.value = f"Case: {answers.get('name')}"
+            self._set_active_case(cid, answers.get("name") or "Untitled case")
         else:
             db.update_case(
                 self.case_id,
@@ -462,12 +639,15 @@ class AppUI:
             return
         self.discovery_log = self._new_log(160)
         self.timeline_container = ft.Column(spacing=0)
+        self.evidence_container = ft.Column(spacing=4)
         self._render_timeline()
+        self._render_evidence()
 
         self._set_content(
             self._section_title(
                 "Discovery & Timeline Engine",
-                "Ingest evidence (PDF, image, audio/video) and build an interactive timeline.",
+                "Ingest evidence (PDF, image, audio/video) and build an interactive timeline. "
+                "Scanned/image-heavy PDFs are OCR'd automatically.",
             ),
             self._card(
                 ft.Row(
@@ -493,6 +673,10 @@ class AppUI:
                     wrap=True,
                 ),
                 self.discovery_log,
+            ),
+            self._card(
+                ft.Text("Evidence on file", weight=ft.FontWeight.BOLD, color=TEXT),
+                self.evidence_container,
             ),
             self._card(
                 ft.Text("Timeline", weight=ft.FontWeight.BOLD, color=TEXT),
@@ -536,6 +720,64 @@ class AppUI:
         self.timeline_container.controls = rows
         self.page.update()
 
+    def _render_evidence(self) -> None:
+        docs = db.list_documents(self.case_id) if self.case_id else []
+        if not docs:
+            self.evidence_container.controls = [
+                ft.Text("No evidence ingested yet.", color=MUTED)
+            ]
+            try:
+                self.page.update()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        icons = {"pdf": "picture_as_pdf", "image": "image", "media": "audiotrack",
+                 "portal": "cloud_download", "document": "description"}
+        rows = []
+        for d in docs:
+            chars = len(d.get("content") or "")
+            meta = d.get("metadata") or {}
+            extra = ""
+            if meta.get("GPSLatitude"):
+                extra = "  · GPS"
+            if meta.get("DateTimeOriginal") or meta.get("DateTime"):
+                extra += "  · timestamped"
+            rows.append(
+                ft.Row(
+                    [
+                        ft.Icon(icons.get(d.get("doc_type"), "description"), color=ACCENT_2, size=18),
+                        ft.Column(
+                            [
+                                ft.Text(d["filename"], color=TEXT, size=13),
+                                ft.Text(
+                                    f"{d.get('doc_type','document')} · {chars:,} chars{extra}",
+                                    color=MUTED, size=11,
+                                ),
+                            ],
+                            spacing=1, expand=True,
+                        ),
+                        ft.IconButton(
+                            icon="delete", icon_color=MUTED, tooltip="Remove from case",
+                            on_click=lambda e, did=d["id"]: self._delete_evidence(did),
+                        ),
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                )
+            )
+        self.evidence_container.controls = rows
+        try:
+            self.page.update()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _delete_evidence(self, document_id: int) -> None:
+        from rag import STORE
+
+        STORE.delete_document(self.case_id, document_id)
+        db.delete_document(self.case_id, document_id)
+        self._render_evidence()
+        self.snack("Evidence removed.", OK)
+
     def _on_evidence_picked(self, e: ft.FilePickerResultEvent) -> None:
         if not e.files or self.case_id is None:
             return
@@ -563,6 +805,7 @@ class AppUI:
             else:
                 self.snack(f"Ingested {result} file(s).", OK)
             self._render_timeline()
+            self._render_evidence()
 
         self.run_bg(work, done)
 
@@ -811,6 +1054,8 @@ class AppUI:
             multiline=True,
             min_lines=12,
         )
+        self.drafts_container = ft.Column(spacing=4)
+        self._render_drafts()
 
         self._set_content(
             self._section_title(
@@ -837,7 +1082,71 @@ class AppUI:
                     ]
                 ),
             ),
+            self._card(
+                ft.Text("Saved drafts", weight=ft.FontWeight.BOLD, color=TEXT),
+                self.drafts_container,
+            ),
         )
+
+    def _render_drafts(self) -> None:
+        drafts = db.list_drafts(self.case_id) if self.case_id else []
+        if not drafts:
+            self.drafts_container.controls = [
+                ft.Text("No drafts saved yet. Export a motion to save it here.", color=MUTED)
+            ]
+            try:
+                self.page.update()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        rows = []
+        for d in drafts:
+            buttons = [
+                ft.TextButton(
+                    "Load into editor",
+                    on_click=lambda e, body=d["body"], title=d["title"]: self._load_draft(title, body),
+                ),
+            ]
+            if d.get("export_path") and os.path.isfile(d["export_path"]):
+                buttons.append(
+                    ft.TextButton(
+                        "Open file",
+                        on_click=lambda e, p=d["export_path"]: self._open_path(p),
+                    )
+                )
+                buttons.append(
+                    ft.TextButton(
+                        "Open folder",
+                        on_click=lambda e, p=d["export_path"]: self._open_path(os.path.dirname(p)),
+                    )
+                )
+            rows.append(
+                ft.Row(
+                    [
+                        ft.Icon("description", color=ACCENT_2, size=18),
+                        ft.Column(
+                            [
+                                ft.Text(d["title"], color=TEXT, size=13),
+                                ft.Text(d["created_at"], color=MUTED, size=11),
+                            ],
+                            spacing=1, expand=True,
+                        ),
+                        ft.Row(buttons, wrap=True),
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                )
+            )
+        self.drafts_container.controls = rows
+        try:
+            self.page.update()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _load_draft(self, title: str, body: str) -> None:
+        self.brief_type.value = title
+        self.brief_output.value = body
+        self.page.update()
+        self.snack("Draft loaded into the editor.", OK)
 
     def _draft_brief(self, e: ft.ControlEvent) -> None:
         motion_type = self.brief_type.value.strip()
@@ -895,11 +1204,13 @@ class AppUI:
             if error:
                 self.snack(f"Export failed: {error}", DANGER)
                 return
-            draft_id = db.add_draft(self.case_id, title, body, result)
-            msg = f"Exported to {result}"
+            db.add_draft(self.case_id, title, body, result)
+            self._render_drafts()
+            msg = "Exported. Use 'Open file' below to view it."
             if notes:
                 msg += "  (" + "; ".join(notes) + ")"
             self.snack(msg, OK)
+            self._open_path(result)
 
         self.run_bg(work, done)
 
@@ -1263,6 +1574,7 @@ class AppUI:
             value=db.get_setting(config.SETTING_DEEPGRAM_KEY),
             password=True, can_reveal_password=True, color=TEXT, width=480,
         )
+        self.settings_test_output = ft.Column(spacing=2)
 
         self._set_content(
             self._section_title(
@@ -1315,8 +1627,64 @@ class AppUI:
                 self.set_tavily,
                 self.set_deepgram,
             ),
-            ft.FilledButton("Save settings", icon="save", on_click=self._save_settings),
+            ft.Row(
+                [
+                    ft.FilledButton("Save settings", icon="save", on_click=self._save_settings),
+                    ft.OutlinedButton(
+                        "Test connection", icon="wifi_tethering", on_click=self._test_models
+                    ),
+                ]
+            ),
+            self._card(
+                ft.Text("Connection test", weight=ft.FontWeight.BOLD, color=TEXT),
+                self.settings_test_output,
+            ),
         )
+
+    def _test_models(self, e: ft.ControlEvent) -> None:
+        # Save first so the test uses what's on screen.
+        self._save_settings(e, silent=True)
+        self.settings_test_output.controls = [ft.Text("Testing…", color=MUTED, size=12)]
+        self.page.update()
+
+        def work() -> List:
+            results = []
+            for tier in (config.TIER_EXTRACTION, config.TIER_MEDIUM, config.TIER_HEAVY):
+                provider, model, _ = self.router.resolve(tier)
+                label = f"{config.TIER_LABELS[tier]} ({provider} · {model})"
+                if not self.router.is_configured(tier):
+                    results.append((label, False, "not configured"))
+                    continue
+                try:
+                    reply = self.router.complete(
+                        "Reply with the single word: OK", tier=tier, max_tokens=10
+                    )
+                    ok = "ok" in reply.lower()
+                    results.append((label, ok, reply.strip()[:60] or "(empty)"))
+                except Exception as exc:  # noqa: BLE001
+                    results.append((label, False, str(exc)[:120]))
+            return results
+
+        def done(result, error) -> None:
+            if error:
+                self.settings_test_output.controls = [ft.Text(f"Error: {error}", color=DANGER)]
+                self.page.update()
+                return
+            rows = []
+            for label, ok, detail in result:
+                rows.append(
+                    ft.Row(
+                        [
+                            ft.Icon("check_circle" if ok else "cancel",
+                                    color=OK if ok else DANGER, size=16),
+                            ft.Text(f"{label} — {detail}", color=TEXT if ok else WARN, size=12),
+                        ]
+                    )
+                )
+            self.settings_test_output.controls = rows
+            self.page.update()
+
+        self.run_bg(work, done)
 
     def _on_sa_picked(self, e: ft.FilePickerResultEvent) -> None:
         if e.files and e.files[0].path:
@@ -1341,7 +1709,7 @@ class AppUI:
         controls["model"].value = config.PROVIDERS[provider]["default_model"]
         self.page.update()
 
-    def _save_settings(self, e: ft.ControlEvent) -> None:
+    def _save_settings(self, e: ft.ControlEvent, silent: bool = False) -> None:
         for tier, controls in self.tier_controls.items():
             pkey, mkey = config.tier_setting_keys(tier)
             db.set_setting(pkey, controls["provider"].value)
@@ -1358,4 +1726,72 @@ class AppUI:
         self.router.reload()
         self.provider_chip.value = self._provider_label()
         self.page.update()
-        self.snack("Settings saved.", OK)
+        if not silent:
+            self.snack("Settings saved.", OK)
+
+    # ======================================================================
+    # Help
+    # ======================================================================
+    def show_help(self) -> None:
+        def step(icon: str, title: str, body: str) -> ft.Control:
+            return ft.Row(
+                [
+                    ft.Icon(icon, color=ACCENT_2, size=20),
+                    ft.Column(
+                        [
+                            ft.Text(title, color=TEXT, weight=ft.FontWeight.BOLD, size=14),
+                            ft.Text(body, color=MUTED, size=12),
+                        ],
+                        spacing=1, expand=True,
+                    ),
+                ],
+                vertical_alignment=ft.CrossAxisAlignment.START,
+            )
+
+        self._set_content(
+            self._section_title("Help & How-To", "A quick tour of each tab."),
+            self._card(
+                ft.Text("Getting started", weight=ft.FontWeight.BOLD, color=TEXT),
+                step("vpn_key", "1. Add your AI keys (Settings)",
+                     "Paste an Anthropic and/or Gemini key, or configure Vertex AI. "
+                     "Use 'Test connection' to confirm they work."),
+                step("question_answer", "2. Start your case (Intake)",
+                     "Answer a few questions and the app builds a baseline case file."),
+                step("upload_file", "3. Add evidence (Discovery & Timeline)",
+                     "Upload PDFs, photos, or audio. Everything is read (scanned pages "
+                     "are OCR'd), turned into a timeline, and checked for contradictions."),
+            ),
+            self._card(
+                ft.Text("What each tab does", weight=ft.FontWeight.BOLD, color=TEXT),
+                step("timeline", "Discovery & Timeline",
+                     "Ingests evidence and flags facts that conflict across sources."),
+                step("travel_explore", "Deep Research",
+                     "Searches free court-opinion databases and writes a cited research memo; "
+                     "can analyse your assigned judge."),
+                step("chat", "Chat (@web)",
+                     "Ask questions about your evidence. Start a message with @web to look "
+                     "something up on the internet. Includes a Legalese Decoder to translate "
+                     "complex text into plain language."),
+                step("description", "Brief Builder",
+                     "Drafts a motion from your timeline + research, scrubs personal info, "
+                     "and exports onto numbered court pleading paper."),
+                step("alarm", "Procedural",
+                     "Calculates filing deadlines and generates cross-examination questions "
+                     "from timeline contradictions."),
+                step("dns", "Court Portal",
+                     "Logs into public case-search sites and downloads documents. If it hits "
+                     "a CAPTCHA it pauses and asks you to solve it — it never bypasses one."),
+            ),
+            self._card(
+                ft.Text("Privacy & safety", weight=ft.FontWeight.BOLD, color=TEXT),
+                ft.Text(
+                    "Your case files stay on this device. AI features send the relevant "
+                    "text to the provider you configured. This app gives legal information "
+                    "and drafting help — not legal advice — and is not a substitute for an "
+                    "attorney. Always verify deadlines and documents against your court's "
+                    "rules before filing.",
+                    color=MUTED, size=12,
+                ),
+                ft.Text(f"Version {config.APP_VERSION}", color=MUTED, size=11),
+            ),
+        )

@@ -140,6 +140,17 @@ These issues were traced and fixed *before* shipping the code:
 
 ---
 
+## Built for a non-technical user
+
+* **First-run disclaimer** and a **Help** tab explaining each feature in plain language.
+* **Guided setup** — a banner walks you to Settings until your AI keys are in, with a one-click **"Test connection"** that verifies each model tier.
+* **Always-visible activity bar** so you know when the assistant is working; the UI never freezes.
+* **Remembers your case** between launches.
+* **Evidence and draft managers** — see everything you've ingested or drafted, delete items, and **open exported pleadings / their folder** with one click.
+* Clear, friendly error messages instead of crashes.
+
+---
+
 ## Project layout
 
 ```
@@ -155,6 +166,10 @@ ui.py            Flet dark-mode UI; all heavy work on background threads
 main.py          Entry point
 requirements.txt Exact dependencies
 ```
+
+The UI also includes a **Help** tab and a first-run disclaimer; it remembers the
+last active case, shows a global activity bar during background work, and lets
+you manage ingested evidence and exported drafts.
 
 ---
 

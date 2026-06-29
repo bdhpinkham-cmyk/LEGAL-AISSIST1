@@ -175,6 +175,13 @@ you manage ingested evidence and exported drafts.
 
 ## Quick start (run locally)
 
+**Easiest:** double-click **`run.sh`** (macOS/Linux) or **`run.bat`** (Windows).
+On first run it creates a virtual environment, installs dependencies, and
+launches the app; after that it just launches. Then open **Settings** and add
+your API key.
+
+Manual steps (equivalent to the launcher):
+
 ```bash
 # 1. Create and activate a virtual environment
 python -m venv .venv

@@ -1,4 +1,13 @@
-# Python
+# --- Secrets (never commit) ---
+.env
+.env.*
+!.env.example
+*.key
+*serviceAccount*.json
+google-services.json
+GoogleService-Info.plist
+
+# --- Python (backend/, archive/flet-app/, root scripts) ---
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -6,16 +15,39 @@ __pycache__/
 venv/
 env/
 
-# Build artifacts
+# --- Build artifacts ---
 build/
 dist/
 *.spec
 
-# Local app data / secrets (never commit case data or API keys)
+# --- Local app data (never commit case data) ---
 *.db
 *.sqlite3
 *.log
 
-# OS
+# --- Flutter / Dart (mobile/) ---
+.dart_tool/
+.flutter-plugin-dependencies
+.packages
+.pub-cache/
+.pub/
+mobile/build/
+mobile/android/.gradle/
+mobile/android/local.properties
+mobile/android/**/GeneratedPluginRegistrant.java
+mobile/ios/Pods/
+mobile/ios/.symlinks/
+mobile/ios/Flutter/Flutter.framework
+mobile/ios/Flutter/Flutter.podspec
+mobile/ios/Flutter/Generated.xcconfig
+mobile/ios/Runner/GeneratedPluginRegistrant.*
+mobile/**/*.g.dart
+
+# --- Supabase local config / secrets ---
+supabase/.temp/
+supabase/.branches/
+.supabase/
+
+# --- OS ---
 .DS_Store
 Thumbs.db
